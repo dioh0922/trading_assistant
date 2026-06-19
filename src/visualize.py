@@ -23,6 +23,8 @@ import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
 
+from src.step5_assist_signal import SIGNAL_BULLISH, SIGNAL_CAUTION, SIGNAL_NEUTRAL, evaluate_signal_quality
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -332,6 +334,195 @@ def plot_step3(df: pd.DataFrame, save_path: Path) -> None:
 
 
 # =============================================================================
+# ステップ4の可視化
+#   1. フォールドごとの評価指標（accuracy/precision/recall/f1/roc_auc）
+#   2. 特徴量重要度 Top15
+#   3. 価格 + Out-of-Sample予測確率のヒートライン
+#   4. 混同行列（全フォールド集計）
+# =============================================================================
+
+def plot_step4(fold_metrics: pd.DataFrame,
+               feature_importance: pd.DataFrame,
+               oos_predictions: pd.DataFrame,
+               price_df: pd.DataFrame,
+               save_path: Path) -> None:
+    from sklearn.metrics import confusion_matrix
+
+    fig = plt.figure(figsize=(14, 16))
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 1.5, 2, 1.2])
+
+    ax_metrics = fig.add_subplot(gs[0, :])
+    ax_importance = fig.add_subplot(gs[1, :])
+    ax_price = fig.add_subplot(gs[2, :])
+    ax_cm = fig.add_subplot(gs[3, 0])
+    ax_proba_hist = fig.add_subplot(gs[3, 1])
+
+    # --- ① フォールドごとの評価指標 ---
+    metrics_cols = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+    x = np.arange(len(fold_metrics))
+    width = 0.15
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for i, col in enumerate(metrics_cols):
+        ax_metrics.bar(x + i * width, fold_metrics[col], width=width,
+                       label=col, color=colors[i])
+    ax_metrics.axhline(0.5, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax_metrics.set_xticks(x + width * 2)
+    ax_metrics.set_xticklabels([f"fold{f}" for f in fold_metrics["fold"]])
+    ax_metrics.set_ylabel("スコア")
+    ax_metrics.set_title("ステップ4: フォールドごとの評価指標（Walk-Forward Validation）")
+    ax_metrics.legend(loc="upper right", fontsize=8, ncol=5)
+    ax_metrics.grid(alpha=0.3, axis="y")
+
+    # --- ② 特徴量重要度 Top15 ---
+    top_importance = feature_importance.head(15).sort_values("importance")
+    ax_importance.barh(top_importance.index, top_importance["importance"], color="teal")
+    ax_importance.set_xlabel("重要度")
+    ax_importance.set_title("特徴量重要度 Top15")
+    ax_importance.grid(alpha=0.3, axis="x")
+
+    # --- ③ 価格 + OOS予測確率 ---
+    ax_price.plot(price_df.index, price_df["close"], color=COLOR_NEUTRAL,
+                 linewidth=1, alpha=0.6, label="終値")
+    ax_price2 = ax_price.twinx()
+    ax_price2.plot(oos_predictions.index, oos_predictions["y_proba"],
+                   color="purple", linewidth=0.8, alpha=0.7, label="予測確率(利確到達)")
+    ax_price2.axhline(0.5, color="black", linewidth=0.6, linestyle="--", alpha=0.5)
+    ax_price2.set_ylim(0, 1)
+    ax_price2.set_ylabel("予測確率", color="purple")
+
+    # 検証期間の境界を縦線で表示
+    fold_boundaries = oos_predictions.groupby("fold").apply(lambda g: g.index[0])
+    for fb in fold_boundaries:
+        ax_price.axvline(fb, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+
+    ax_price.set_ylabel("価格")
+    ax_price.set_title("価格と Out-of-Sample 予測確率の推移（縦線=各フォールド検証開始位置）")
+    lines1, labels1 = ax_price.get_legend_handles_labels()
+    lines2, labels2 = ax_price2.get_legend_handles_labels()
+    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    ax_price.grid(alpha=0.3)
+
+    # --- ④ 混同行列（全フォールド集計） ---
+    cm = confusion_matrix(oos_predictions["y_true"], oos_predictions["y_pred"])
+    im = ax_cm.imshow(cm, cmap="Blues")
+    ax_cm.set_xticks([0, 1]); ax_cm.set_xticklabels(["予測0", "予測1"])
+    ax_cm.set_yticks([0, 1]); ax_cm.set_yticklabels(["実際0", "実際1"])
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax_cm.text(j, i, str(cm[i, j]), ha="center", va="center",
+                      color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=12)
+    ax_cm.set_title("混同行列（全OOS合算）")
+
+    # --- ⑤ 予測確率の分布（正解/不正解別） ---
+    correct = oos_predictions["y_true"] == oos_predictions["y_pred"]
+    ax_proba_hist.hist(oos_predictions.loc[correct, "y_proba"], bins=20, alpha=0.6,
+                       color="green", label="正解")
+    ax_proba_hist.hist(oos_predictions.loc[~correct, "y_proba"], bins=20, alpha=0.6,
+                       color="red", label="不正解")
+    ax_proba_hist.set_xlabel("予測確率")
+    ax_proba_hist.set_ylabel("件数")
+    ax_proba_hist.set_title("予測確率の分布")
+    ax_proba_hist.legend(fontsize=8)
+    ax_proba_hist.grid(alpha=0.3)
+
+    ax_price.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.autofmt_xdate()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=130)
+    plt.close(fig)
+    print(f"ステップ4チャート保存完了: {save_path}")
+
+
+# =============================================================================
+# ステップ5の可視化
+#   1. 価格 + シグナルマーカー（強気=緑△ / 警戒=赤背景帯）
+#   2. シグナル別の件数
+#   3. シグナル別の勝率（tb_label平均）
+#   4. シグナル別の平均リターン（tb_return平均）
+# =============================================================================
+
+def plot_step5(df: pd.DataFrame, save_path: Path) -> None:
+    has_labels = "tb_label" in df.columns and "tb_return" in df.columns
+
+    fig = plt.figure(figsize=(14, 13))
+    if has_labels:
+        gs = fig.add_gridspec(3, 2, height_ratios=[3, 1, 1])
+        ax_price = fig.add_subplot(gs[0, :])
+        ax_count = fig.add_subplot(gs[1, 0])
+        ax_winrate = fig.add_subplot(gs[1, 1])
+        ax_return = fig.add_subplot(gs[2, :])
+    else:
+        gs = fig.add_gridspec(2, 1, height_ratios=[3, 1])
+        ax_price = fig.add_subplot(gs[0, :])
+        ax_count = fig.add_subplot(gs[1, :])
+
+    signal_colors = {SIGNAL_BULLISH: "#2ca02c", SIGNAL_CAUTION: "#d62728", SIGNAL_NEUTRAL: "#7f7f7f"}
+
+    # --- ① 価格 + シグナルマーカー ---
+    ax_price.plot(df.index, df["close"], color=COLOR_PRICE, linewidth=1, alpha=0.7, label="終値")
+
+    bullish_points = df[df["assist_signal"] == SIGNAL_BULLISH]
+    ax_price.scatter(bullish_points.index, bullish_points["close"],
+                     marker="^", color=signal_colors[SIGNAL_BULLISH], s=50, zorder=5,
+                     label="強気シグナル")
+
+    caution_flag = df["assist_signal"] == SIGNAL_CAUTION
+    ax_price.fill_between(df.index, ax_price.get_ylim()[0], ax_price.get_ylim()[1],
+                          where=caution_flag, color=signal_colors[SIGNAL_CAUTION],
+                          alpha=0.08, step="mid", label="警戒区間")
+
+    ax_price.set_ylabel("価格")
+    ax_price.set_title("ステップ5: 3段階アシストシグナル（強気/警戒/中立）")
+    ax_price.legend(loc="upper left", fontsize=8)
+    ax_price.grid(alpha=0.3)
+
+    # --- ② シグナル別の件数 ---
+    counts = df["assist_signal"].value_counts().reindex(
+        [SIGNAL_BULLISH, SIGNAL_CAUTION, SIGNAL_NEUTRAL]
+    )
+    ax_count.bar(counts.index, counts.values,
+                color=[signal_colors[s] for s in counts.index])
+    ax_count.set_ylabel("件数")
+    ax_count.set_title("シグナル別 件数")
+    for i, v in enumerate(counts.values):
+        ax_count.text(i, v, str(v), ha="center", va="bottom", fontsize=9)
+    ax_count.grid(alpha=0.3, axis="y")
+
+    if has_labels:
+        summary = evaluate_signal_quality(df)
+
+        # --- ③ シグナル別の勝率 ---
+        ax_winrate.bar(summary.index, summary["勝率"],
+                      color=[signal_colors[s] for s in summary.index])
+        ax_winrate.axhline(0.5, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax_winrate.set_ylabel("勝率(tb_label平均)")
+        ax_winrate.set_title("シグナル別 勝率")
+        ax_winrate.set_ylim(0, 1)
+        for i, v in enumerate(summary["勝率"]):
+            ax_winrate.text(i, v, f"{v:.1%}", ha="center", va="bottom", fontsize=9)
+        ax_winrate.grid(alpha=0.3, axis="y")
+
+        # --- ④ シグナル別の平均リターン ---
+        ax_return.bar(summary.index, summary["平均リターン"] * 100,
+                      color=[signal_colors[s] for s in summary.index])
+        ax_return.axhline(0, color="black", linewidth=0.8)
+        ax_return.set_ylabel("平均リターン(%)")
+        ax_return.set_title("シグナル別 平均リターン（バリア到達時点）")
+        ax_return.grid(alpha=0.3, axis="y")
+
+    ax_price.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.autofmt_xdate()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=130)
+    plt.close(fig)
+    print(f"ステップ5チャート保存完了: {save_path}")
+
+
+# =============================================================================
 # メイン処理
 # =============================================================================
 
@@ -356,7 +547,35 @@ def visualize_step3(csv_path: Path = None, save_path: Path = None) -> None:
     plot_step3(df, save_path)
 
 
+def visualize_step4(fold_metrics_path: Path = None,
+                    feature_importance_path: Path = None,
+                    oos_predictions_path: Path = None,
+                    price_csv_path: Path = None,
+                    save_path: Path = None) -> None:
+    fold_metrics_path = fold_metrics_path or RESOURCE_DIR / "step4_fold_metrics.csv"
+    feature_importance_path = feature_importance_path or RESOURCE_DIR / "step4_feature_importance.csv"
+    oos_predictions_path = oos_predictions_path or RESOURCE_DIR / "step4_oos_predictions.csv"
+    price_csv_path = price_csv_path or RESOURCE_DIR / "step3_dataset.csv"
+    save_path = save_path or RESOURCE_DIR / "step4_chart.png"
+
+    fold_metrics = pd.read_csv(fold_metrics_path)
+    feature_importance = pd.read_csv(feature_importance_path, index_col=0)
+    oos_predictions = pd.read_csv(oos_predictions_path, index_col=0, parse_dates=True)
+    price_df = _load_dataset(price_csv_path)
+
+    plot_step4(fold_metrics, feature_importance, oos_predictions, price_df, save_path)
+
+
+def visualize_step5(csv_path: Path = None, save_path: Path = None) -> None:
+    csv_path = csv_path or RESOURCE_DIR / "step5_dataset.csv"
+    save_path = save_path or RESOURCE_DIR / "step5_chart.png"
+    df = _load_dataset(csv_path)
+    plot_step5(df, save_path)
+
+
 if __name__ == "__main__":
     visualize_step1()
     visualize_step2()
     visualize_step3()
+    visualize_step4()
+    visualize_step5()
