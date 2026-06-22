@@ -1,0 +1,7 @@
+/src/__pycache__
+/resource/*.csv
+/resource/*.png
+/resource/*.xlsx
+/resource/*.pkl
+/resource
+/report
