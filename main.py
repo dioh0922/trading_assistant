@@ -129,8 +129,8 @@ def main() -> None:
         print("処理を終了します。")
         sys.exit(0)
 
-    # --- 結果出力先: resource/{code_label}/ （無ければ作成） ---
-    output_dir = RESOURCE_DIR / code_label
+    # --- 結果出力先: resource/{code_label}/{barrier_mode} （無ければ作成） ---
+    output_dir = RESOURCE_DIR / code_label / args.barrier_mode
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"結果出力先: {output_dir}\n")
 
