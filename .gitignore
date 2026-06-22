@@ -3,3 +3,5 @@
 /resource/*.png
 /resource/*.xlsx
 /resource/*.pkl
+/resource
+/report
