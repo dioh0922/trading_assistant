@@ -100,18 +100,26 @@ def generate_assist_signal(df: pd.DataFrame,
     """
     d = df.copy()
 
-    for col in ["rsi14", "rsi_bullish_divergence", "dev_ma25_zscore", "is_overbought_heat"]:
+    for col in ["rsi14", "rsi_bullish_divergence", "dev_ma25_zscore", "is_overbought_heat", "weekly_trend", "volume_ratio"]:
         if col not in d.columns:
             raise KeyError(
                 f"'{col}' が見つかりません。"
-                f"先に step2_domain_features.build_step2_dataset() を実行してください。"
+                f"特徴量エンジニアリング（ステップ1・2）が正しく実行されているか確認してください。"
             )
 
     rsi_reversal      = _detect_rsi_reversal(d, lookback=rsi_lookback)
     deviation_shrink   = _detect_deviation_shrinking(d, lookback=dev_lookback)
     overheat_warning   = _detect_overheat_warning(d)
 
-    bullish_cond = rsi_reversal & deviation_shrink
+    # 順張り型の強気条件を追加
+    trending_bullish = (
+        (d["weekly_trend"] == 1) &
+        (d["rsi14"] >= 50) &
+        (d["volume_ratio"] >= 1.2)
+    )
+
+    # 既存の逆張り強気条件と順張り強気条件のORを取る
+    bullish_cond = (rsi_reversal & deviation_shrink) | trending_bullish
 
     signal = np.where(
         overheat_warning, SIGNAL_CAUTION,
@@ -121,6 +129,7 @@ def generate_assist_signal(df: pd.DataFrame,
     d["rsi_reversal_flag"]   = rsi_reversal.astype(int)
     d["deviation_shrink_flag"] = deviation_shrink.astype(int)
     d["overheat_warning_flag"] = overheat_warning.astype(int)
+    d["trending_bullish_flag"] = trending_bullish.astype(int)
     d["assist_signal"] = signal
 
     return d

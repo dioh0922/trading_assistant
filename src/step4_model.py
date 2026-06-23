@@ -141,6 +141,10 @@ def walk_forward_validation(df: pd.DataFrame,
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
+        # Train/Testの正例（label=1）比率を計算
+        train_label_1_rate = y_train.mean()
+        test_label_1_rate = y_test.mean()
+
         model = _build_model()
         model.fit(X_train, y_train)
 
@@ -167,6 +171,8 @@ def walk_forward_validation(df: pd.DataFrame,
             "train_start": train_start, "train_end": train_end,
             "test_start": test_start, "test_end": test_end,
             "n_train": len(train_idx), "n_test": len(test_idx),
+            "label_1_rate_train": train_label_1_rate,
+            "label_1_rate_test": test_label_1_rate,
             "accuracy": acc, "precision": prec, "recall": rec,
             "f1": f1, "roc_auc": auc,
         })
@@ -237,8 +243,14 @@ def build_step4_results(step3_df: pd.DataFrame,
 
     fold_metrics = results["fold_metrics"]
     print("\n--- フォールドごとの評価指標 ---")
-    print(fold_metrics[["fold", "n_train", "n_test", "accuracy", "precision",
-                        "recall", "f1", "roc_auc"]].to_string(index=False))
+    print(fold_metrics[["fold", "n_train", "n_test",
+                        "label_1_rate_train", "label_1_rate_test",
+                        "accuracy", "precision", "recall", "f1", "roc_auc"]].to_string(index=False))
+
+    # Fold間のAUC標準偏差の計算と表示
+    auc_std = fold_metrics["roc_auc"].std()
+    print(f"\nFold間 AUC標準偏差: {auc_std:.4f} (目安: 0.03以下が安定)")
+    results["auc_std"] = auc_std
 
     print("\n--- 平均スコア（全フォールド） ---")
     print(fold_metrics[["accuracy", "precision", "recall", "f1", "roc_auc"]].mean())

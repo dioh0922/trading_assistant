@@ -54,6 +54,7 @@ from src.step2_domain_features import build_step2_dataset
 from src.step3_labeling import build_step3_dataset
 from src.step4_model import build_step4_results, save_step4_results
 from src.step5_assist_signal import build_step5_dataset
+from src.step6_filter import train_drawdown_model, apply_final_filter, evaluate_final_performance
 from src.visualize import plot_step1, plot_step2, plot_step3, plot_step4, plot_step5
 
 
@@ -83,6 +84,10 @@ def parse_args() -> argparse.Namespace:
                        help="最大保有営業日数。省略時はモードに応じて自動設定（ATR=10日 / 固定%%=45日）")
     parser.add_argument("--drawdown-threshold", type=float, default=0.03,
                        help="見送りシグナル用のフォワードドローダウン閾値")
+    parser.add_argument("--enable-step6", action="store_true",
+                        help="ステップ6の最終意思決定フィルタ（ドローダウン予測フィルタ）を有効にする")
+    parser.add_argument("--drawdown-prob-limit", type=float, default=0.40,
+                        help="[ステップ6] ドローダウンを回避するための許容ドローダウン予測確率閾値")
 
     args = parser.parse_args()
 
@@ -213,6 +218,41 @@ def main() -> None:
     # --- 確認用: 先頭5行を表示 ---
     print("\n--- ステップ5 先頭5行 ---")
     print(step5_df[["close", "assist_signal"]].head())
+
+    # --- ステップ6: 最終意思決定フィルタ ---
+    if args.enable_step6:
+        print("\n" + "=" * 60)
+        print(f"ステップ6: 最終意思決定フィルタ [ドローダウン許容確率: {args.drawdown_prob_limit:.1%}]")
+        print("=" * 60)
+        
+        from src.step4_model import select_feature_columns
+        feature_cols = select_feature_columns(step3_df)
+        
+        # 1. ドローダウン予測モデルの学習と予測確率の取得
+        print("ドローダウン予測モデルを構築中...")
+        dd_results = train_drawdown_model(step3_df, feature_cols)
+        dd_pred_proba = dd_results["oos_predictions"]["dd_proba"]
+        
+        # 2. 最終フィルタの適用
+        step6_df = apply_final_filter(
+            step5_df,
+            dd_pred_proba=dd_pred_proba,
+            dd_threshold=args.drawdown_prob_limit
+        )
+        
+        # 3. パフォーマンス評価と出力
+        evaluate_final_performance(step6_df)
+        
+        # 4. CSVの保存
+        step6_output_path = output_dir / "step6_dataset.csv"
+        step6_df.to_csv(step6_output_path)
+        print(f"\nCSV保存完了: {step6_output_path}")
+        
+        # ドローダウン予測モデルを保存
+        dd_model_path = output_dir / "step6_dd_model.pkl"
+        import joblib
+        joblib.dump(dd_results["final_model"], dd_model_path)
+        print(f"ドローダウン予測モデル保存完了: {dd_model_path}")
 
 
 if __name__ == "__main__":

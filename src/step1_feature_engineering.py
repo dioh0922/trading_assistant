@@ -192,6 +192,22 @@ def add_daily_features(daily_df: pd.DataFrame) -> pd.DataFrame:
     # 加速度 = 短期モメンタム - 長期モメンタム（急騰の一時性を捉える）
     d["mom_accel"] = d["mom5"] - d["mom20"]
 
+    # ---- 出来高系特徴量 ----
+    vol_mean = d["volume"].rolling(20).mean()
+    vol_std  = d["volume"].rolling(20).std()
+    d["volume_zscore"] = (d["volume"] - vol_mean) / vol_std.replace(0, np.nan)
+    d["volume_ratio"] = d["volume"] / vol_mean.replace(0, np.nan)
+
+    # ---- ボリンジャーバンド幅 (bb_width) の追加 ----
+    d["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
+    d["bb_width_zscore"] = (
+        (d["bb_width"] - d["bb_width"].rolling(60).mean())
+        / d["bb_width"].rolling(60).std().replace(0, np.nan)
+    )
+
+    # ---- ATRパーセンタイル (atr_percentile) の追加 ----
+    d["atr_percentile"] = d["atr14"].rolling(250).rank(pct=True)
+
     return d
 
 
