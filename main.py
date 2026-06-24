@@ -10,6 +10,8 @@
     python main.py --barrier-mode fixed_pct                 # 固定%モードをデフォルト値(+10%/-5%)で実行
     python main.py --barrier-mode fixed_pct --tp-pct 0.10 --sl-pct 0.05
     python main.py --tp-pct 0.10 --sl-pct 0.05               # --barrier-mode省略時もpct指定で自動的にfixed_pctになる
+    python main.py --no-step6                               # ステップ6を無効化してステップ5までで止める
+    python main.py --drawdown-prob-limit 0.60               # MLフィルタも有効化（閾値指定時）
 
 コマンドライン引数:
     --code STR                       4桁の銘柄コードを指定すると resource/{code}.xlsx を読み込む。
@@ -22,6 +24,10 @@
     --sl-atr-mult FLOAT              [ATRモード] 損切りのATR倍率（デフォルト1.5）
     --holding-period INT             最大保有営業日数（省略時: ATR=10日 / 固定%=45日 を自動設定）
     --drawdown-threshold FLOAT       見送りシグナル用ドローダウン閾値（デフォルト0.03 = 3%）
+    --step6 / --no-step6             ステップ6有効/無効（デフォルト: 有効）
+    --drawdown-prob-limit FLOAT      [ステップ6] ドローダウンMLフィルタの確率閾値。
+                                      1.0(デフォルト)=ML無効（ATRルールのみ）。
+                                      0.60ー0.70返すとMLフィルタを併用。
 
 ディレクトリ構成:
     project/
@@ -84,10 +90,12 @@ def parse_args() -> argparse.Namespace:
                        help="最大保有営業日数。省略時はモードに応じて自動設定（ATR=10日 / 固定%%=45日）")
     parser.add_argument("--drawdown-threshold", type=float, default=0.03,
                        help="見送りシグナル用のフォワードドローダウン閾値")
-    parser.add_argument("--enable-step6", action="store_true",
-                        help="ステップ6の最終意思決定フィルタ（ドローダウン予測フィルタ）を有効にする")
-    parser.add_argument("--drawdown-prob-limit", type=float, default=0.40,
-                        help="[ステップ6] ドローダウンを回避するための許容ドローダウン予測確率閾値")
+    parser.add_argument("--step6", action=argparse.BooleanOptionalAction, default=True,
+                         help="ステップ6の最終意思決定フィルタを有効にする。--no-step6で無効化（デフォルト: 有効）")
+    parser.add_argument("--drawdown-prob-limit", type=float, default=1.0,
+                         help="[ステップ6] ドローダウンMLフィルタの確率閾値。"
+                              "1.0(デフォルト)=ML無効（ATRルールのみ）。"
+                              "0.60ー0.70を指定するとMLフィルタも併用")
 
     args = parser.parse_args()
 
@@ -220,34 +228,37 @@ def main() -> None:
     print(step5_df[["close", "assist_signal"]].head())
 
     # --- ステップ6: 最終意思決定フィルタ ---
-    if args.enable_step6:
+    if args.step6:
+        # drawdown-prob-limit が 1.0 のときは ML フィルタ実質無効（ATR ルールのみ）
+        ml_enabled = args.drawdown_prob_limit < 1.0
+        mode_label = f"MLフィルタ有効 (閾値: {args.drawdown_prob_limit:.0%})" if ml_enabled else "ATRルールのみ (ML無効)"
         print("\n" + "=" * 60)
-        print(f"ステップ6: 最終意思決定フィルタ [ドローダウン許容確率: {args.drawdown_prob_limit:.1%}]")
+        print(f"ステップ6: 最終意思決定フィルタ [{mode_label}]")
         print("=" * 60)
-        
+
         from src.step4_model import select_feature_columns
         feature_cols = select_feature_columns(step3_df)
-        
+
         # 1. ドローダウン予測モデルの学習と予測確率の取得
         print("ドローダウン予測モデルを構築中...")
         dd_results = train_drawdown_model(step3_df, feature_cols)
         dd_pred_proba = dd_results["oos_predictions"]["dd_proba"]
-        
+
         # 2. 最終フィルタの適用
         step6_df = apply_final_filter(
             step5_df,
             dd_pred_proba=dd_pred_proba,
             dd_threshold=args.drawdown_prob_limit
         )
-        
+
         # 3. パフォーマンス評価と出力
         evaluate_final_performance(step6_df)
-        
+
         # 4. CSVの保存
         step6_output_path = output_dir / "step6_dataset.csv"
         step6_df.to_csv(step6_output_path)
         print(f"\nCSV保存完了: {step6_output_path}")
-        
+
         # ドローダウン予測モデルを保存
         dd_model_path = output_dir / "step6_dd_model.pkl"
         import joblib
