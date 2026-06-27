@@ -12,6 +12,7 @@
     python main.py --tp-pct 0.10 --sl-pct 0.05               # --barrier-mode省略時もpct指定で自動的にfixed_pctになる
     python main.py --no-step6                               # ステップ6を無効化してステップ5までで止める
     python main.py --drawdown-prob-limit 0.60               # MLフィルタも有効化（閾値指定時）
+    python main.py --code 7701 --today                      # パイプライン再実行せず今日のシグナルのみ出力
 
 コマンドライン引数:
     --code STR                       4桁の銘柄コードを指定すると resource/{code}.xlsx を読み込む。
@@ -28,6 +29,9 @@
     --drawdown-prob-limit FLOAT      [ステップ6] ドローダウンMLフィルタの確率閾値。
                                       1.0(デフォルト)=ML無効（ATRルールのみ）。
                                       0.60ー0.70返すとMLフィルタを併用。
+    --today                          パイプラインを再実行せず、保存済みの
+                                      step6_dataset.csv（なければstep5_dataset.csv）から
+                                      今日のエントリー判断レポートのみを出力する。
 
 ディレクトリ構成:
     project/
@@ -55,12 +59,15 @@
 import argparse
 import sys
 
+import pandas as pd
+
 from src.step1_feature_engineering import build_step1_dataset, RESOURCE_DIR
 from src.step2_domain_features import build_step2_dataset
 from src.step3_labeling import build_step3_dataset
 from src.step4_model import build_step4_results, save_step4_results
 from src.step5_assist_signal import build_step5_dataset
 from src.step6_filter import train_drawdown_model, apply_final_filter, evaluate_final_performance
+from src.step7_entry_signal import build_entry_report, load_source_df, save_report
 from src.visualize import plot_step1, plot_step2, plot_step3, plot_step4, plot_step5
 
 
@@ -96,6 +103,29 @@ def parse_args() -> argparse.Namespace:
                          help="[ステップ6] ドローダウンMLフィルタの確率閾値。"
                               "1.0(デフォルト)=ML無効（ATRルールのみ）。"
                               "0.60ー0.70を指定するとMLフィルタも併用")
+    parser.add_argument(
+        "--today", action="store_true", default=False,
+        help="パイプラインを再実行せず、保存済みのstep6_dataset.csv"
+             "（なければstep5_dataset.csv）から今日のエントリー判断レポートのみを出力する。",
+    )
+    parser.add_argument(
+        "--scan", action="store_true", default=False,
+        help="resource/ 内の全4桁コードXLSXを対象に一括スクリーニングを実行する。",
+    )
+    parser.add_argument(
+        "--force", action="store_true", default=False,
+        help="[--scanと併用] キャッシュを無視して全銘柄のパイプラインを強制再実行する。",
+    )
+    parser.add_argument(
+        "--target-price", type=float, default=None,
+        help="[ステップ9] 目標価格を円で指定（例: --target-price 5000）。"
+             "現在の終値より高い値を指定してください。",
+    )
+    parser.add_argument(
+        "--target-pct", type=float, default=None,
+        help="[ステップ9] 目標上昇率を割合で指定（例: --target-pct 0.15 で +15%%）。"
+             "--target-price と --target-pct はどちらか一方のみ指定してください。",
+    )
 
     args = parser.parse_args()
 
@@ -130,6 +160,31 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # ─────────────────────────────────────────────────────────
+    # --scan モード: 全銘柄一括スクリーニング（ここで完結）
+    # ─────────────────────────────────────────────────────────
+    if args.scan:
+        from src.step8_scanner import scan_all, build_scan_report, save_scan_report
+        tp = args.tp_pct if args.barrier_mode == "fixed_pct" else args.tp_atr_mult
+        sl = args.sl_pct if args.barrier_mode == "fixed_pct" else args.sl_atr_mult
+
+        results = scan_all(
+            barrier_mode=args.barrier_mode,
+            tp=tp, sl=sl,
+            holding_period=args.holding_period,
+            drawdown_threshold=args.drawdown_threshold,
+            step6_enabled=args.step6,
+            dd_prob_limit=args.drawdown_prob_limit,
+            force_update=args.force,
+        )
+
+        report_text = build_scan_report(results)
+        print("\n" + report_text)
+
+        path = save_scan_report(report_text, args.barrier_mode)
+        print(f"\nレポート保存完了: {path}")
+        return
+
     if args.code is not None:
         code_label = args.code
         input_path = RESOURCE_DIR / f"{args.code}.xlsx"
@@ -137,13 +192,53 @@ def main() -> None:
         code_label = "sample"
         input_path = RESOURCE_DIR / "sample.xlsx"
 
+    # --- 結果出力先: resource/{code_label}/{barrier_mode} ---
+    output_dir = RESOURCE_DIR / code_label / args.barrier_mode
+
+    # tp / sl の表示用値
+    if args.barrier_mode == "fixed_pct":
+        tp_disp, sl_disp = args.tp_pct, args.sl_pct
+    else:
+        tp_disp, sl_disp = args.tp_atr_mult, args.sl_atr_mult
+
+    # ─────────────────────────────────────────────────────────
+    # --today モード: パイプラインを再実行せずレポートのみ生成
+    # ─────────────────────────────────────────────────────────
+    if args.today:
+        # 新パス（resource/{code}/{mode}/）が存在しない場合、
+        # 旧パス（resource/{code}/）にフォールバックする
+        if not output_dir.exists():
+            legacy_dir = RESOURCE_DIR / code_label
+            if legacy_dir.exists() and any(legacy_dir.glob("step*.csv")):
+                print(f"[ステップ7] 新パスが見つかりません。旧パスを使用します: {legacy_dir}")
+                output_dir = legacy_dir
+            else:
+                print(f"出力ディレクトリが見つかりません: {output_dir}")
+                print("先に python main.py を実行してパイプラインを完了させてください。")
+                sys.exit(1)
+        try:
+            source_df, source_label = load_source_df(output_dir)
+        except FileNotFoundError as e:
+            print(e)
+            sys.exit(1)
+
+        print(f"\n[ステップ7] {source_label} から今日のシグナルを読み込み中...")
+        report = build_entry_report(source_df, args.barrier_mode, tp_disp, sl_disp,
+                                    source_label)
+        print(report["summary_text"])
+        path = save_report(report, output_dir)
+        print(f"\nレポート保存完了: {path}")
+        return
+
+    # ─────────────────────────────────────────────────────────
+    # 通常モード: パイプライン全体を実行
+    # ─────────────────────────────────────────────────────────
     if not input_path.exists():
         print(f"入力ファイルが見つかりません: {input_path}")
         print("処理を終了します。")
         sys.exit(0)
 
-    # --- 結果出力先: resource/{code_label}/{barrier_mode} （無ければ作成） ---
-    output_dir = RESOURCE_DIR / code_label / args.barrier_mode
+    # --- 結果出力先ディレクトリを作成 ---
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"結果出力先: {output_dir}\n")
 
@@ -264,6 +359,99 @@ def main() -> None:
         import joblib
         joblib.dump(dd_results["final_model"], dd_model_path)
         print(f"ドローダウン予測モデル保存完了: {dd_model_path}")
+
+    # ─────────────────────────────────────────────────────────
+    # ステップ7: 今日のエントリー判断レポートを出力
+    # ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("ステップ7: リアルタイム エントリー判断レポート")
+    print("=" * 60)
+
+    source_df, source_label = load_source_df(output_dir)
+    report = build_entry_report(source_df, args.barrier_mode, tp_disp, sl_disp,
+                                source_label)
+    print(report["summary_text"])
+    report_path = save_report(report, output_dir)
+    print(f"\nレポート保存完了: {report_path}")
+
+    # ─────────────────────────────────────────────────────────
+    # ステップ9: 目標額到達推定
+    # ─────────────────────────────────────────────────────────
+    if args.target_price is not None or args.target_pct is not None:
+        from src.step9_target_estimator import (
+            estimate_empirical, estimate_monte_carlo,
+            generate_regime_comment, build_target_report,
+            save_target_report,
+        )
+
+        print("\n" + "=" * 60)
+        print("ステップ9: 目標額到達推定")
+        print("=" * 60)
+
+        step1_csv = output_dir / "step1_dataset.csv"
+        df_ohlcv = pd.read_csv(step1_csv, index_col=0, parse_dates=True)
+        current_price = df_ohlcv["close"].iloc[-1]
+        analysis_date = df_ohlcv.index[-1].date()
+
+        if args.target_price is not None and args.target_pct is not None:
+            print("エラー: --target-price と --target-pct は同時に指定できません。")
+            sys.exit(1)
+        elif args.target_price is not None:
+            target_price = args.target_price
+            target_pct = (target_price - current_price) / current_price
+        else:
+            target_pct = args.target_pct
+            target_price = current_price * (1 + target_pct)
+
+        if target_pct <= 0:
+            print(f"エラー: 目標価格 ({target_price:,.0f}円) は現在値 "
+                  f"({current_price:,.0f}円) より高くなければなりません。")
+            sys.exit(1)
+
+        try:
+            src_df, _ = load_source_df(output_dir)
+            signal = str(src_df.iloc[-1].get("assist_signal", "不明"))
+            atr_p = src_df.iloc[-1].get("atr_percentile", None)
+        except (FileNotFoundError, IndexError):
+            signal = "不明"
+            atr_p = None
+
+        print("経験的確率を計算中...")
+        empirical = estimate_empirical(df_ohlcv, target_pct)
+        empirical["atr_percentile"] = atr_p
+
+        print("モンテカルロシミュレーション中（10,000パス）...")
+        mc = estimate_monte_carlo(df_ohlcv, target_pct)
+
+        report_text = build_target_report(
+            current_price, target_price, target_pct, analysis_date,
+            empirical, mc, signal, code_label, args.barrier_mode,
+        )
+        report_path = save_target_report(report_text, output_dir)
+
+        emp_90 = empirical.get("reach_prob", {}).get(90, 0)
+        mc_90 = mc.get("reach_prob", {}).get(90, 0)
+        reaches = emp_90 > 0 or mc_90 > 0
+
+        emp_median = empirical.get("days_distribution", {}).get("median")
+        mc_median = mc.get("days_distribution", {}).get("median")
+        emp_days = f"{emp_median:.0f}日" if emp_median is not None else "-"
+        mc_days = f"{mc_median:.0f}日" if mc_median is not None else "-"
+
+        print(
+            f"\n  ステップ9: 目標額到達推定\n"
+            f"    ※ 経験的=過去データの実績ベース  MC=モンテカルロ(GBM)ベース\n"
+            f"    銘柄    : {code_label}\n"
+            f"    目標    : {target_price:,.0f}円 (+{target_pct:.1%})\n"
+            f"    到達    : {'する' if reaches else 'しない'}\n"
+            f"      経験的 : {emp_90:.1%} (90日)\n"
+            f"      MC     : {mc_90:.1%} (90日)\n"
+            f"    日数期待値:\n"
+            f"      経験的 : {emp_days}（中央値）\n"
+            f"      MC     : {mc_days}（中央値）\n"
+            f"    シグナル: {signal}\n"
+            f"    レポート: {report_path}"
+        )
 
 
 if __name__ == "__main__":
