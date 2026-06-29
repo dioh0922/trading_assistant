@@ -271,28 +271,4 @@ def build_step3_dataset(step2_df: pd.DataFrame,
     d["tb_label"] = d["tb_label"].astype(int)
     d["avoid_entry_flag"] = d["avoid_entry_flag"].astype(int)
 
-    mode_label = "固定% (fixed_pct)" if use_fixed_pct else "ATR倍率"
-    print(f"\nバリアモード: {mode_label}")
-    if use_fixed_pct:
-        print(f"  利確: +{tp_pct:.1%}  損切り: -{sl_pct:.1%}  保有期間: {holding_period}営業日")
-    else:
-        print(f"  利確: ATR×{tp_atr_mult}  損切り: ATR×{sl_atr_mult}  保有期間: {holding_period}営業日")
-
-    print(f"\nステップ3 最終データセット: {len(d)}行 × {len(d.columns)}列")
-    print("\nステップ3で追加された特徴量・ラベル:")
-    new_cols = [
-        "tb_label", "tb_barrier", "tb_days_to_touch", "tb_return", "tb_barrier_mode",
-        "forward_max_drawdown", "avoid_entry_flag",
-    ]
-    for col in new_cols:
-        print(f"  {col}")
-
-    # --- ラベル分布のサマリ表示 ---
-    print("\ntb_label 分布 (1=利確到達 / 0=それ以外):")
-    print(d["tb_label"].value_counts().sort_index())
-    print("\ntb_barrier 内訳:")
-    print(d["tb_barrier"].value_counts())
-    print(f"\navoid_entry_flag=1 (ドローダウン{drawdown_threshold:.0%}超え) の割合: "
-        f"{d['avoid_entry_flag'].mean():.1%}")
-
     return d

@@ -55,7 +55,6 @@ def load_daily_data(filepath: str) -> pd.DataFrame:
     # 数値型に変換（Excelの浮動小数点ゆれを丸める）
     df = df.apply(pd.to_numeric, errors="coerce").dropna()
 
-    print(f"日足データ読み込み完了: {len(df)}行 ({df.index[0].date()} ～ {df.index[-1].date()})")
     return df
 
 
@@ -88,8 +87,6 @@ def load_weekly_data(filepath: str, sheet_name: str = "Sheet2") -> pd.DataFrame:
     df.columns = ["open", "high", "low", "close", "volume"]
     df = df.apply(pd.to_numeric, errors="coerce").dropna()
 
-    print(f"週足データ読み込み完了(Sheet2): {len(df)}週 "
-          f"({df.index[0].date()} ～ {df.index[-1].date()})")
     return df
 
 
@@ -107,7 +104,6 @@ def make_weekly_data(daily_df: pd.DataFrame) -> pd.DataFrame:
         "volume": "sum",     # 週間出来高の合計
     }).dropna()
 
-    print(f"週足データ生成完了(リサンプル): {len(weekly)}週")
     return weekly
 
 
@@ -302,8 +298,6 @@ def build_step1_dataset(filepath: str, weekly_sheet: str = "Sheet2") -> pd.DataF
     try:
         weekly = load_weekly_data(filepath, sheet_name=weekly_sheet)
     except (ValueError, KeyError):
-        # シートが存在しない/読み込めない場合は日足からリサンプル生成
-        print(f"'{weekly_sheet}' が見つからないため、日足からリサンプルして週足を生成します。")
         weekly = make_weekly_data(daily[["open", "high", "low", "close", "volume"]])
 
     weekly = add_weekly_features(weekly)
@@ -313,10 +307,5 @@ def build_step1_dataset(filepath: str, weekly_sheet: str = "Sheet2") -> pd.DataF
 
     # --- 欠損値処理（指標計算のウォームアップ期間を除去） ---
     dataset = dataset.dropna()
-
-    print(f"\n最終データセット: {len(dataset)}行 × {len(dataset.columns)}列")
-    print("\n特徴量一覧:")
-    for col in dataset.columns:
-        print(f"  {col}")
 
     return dataset

@@ -233,30 +233,13 @@ def build_step4_results(step3_df: pd.DataFrame,
     """
     feature_cols = select_feature_columns(step3_df)
 
-    print(f"使用バックエンド: {_BACKEND}")
-    print(f"特徴量数: {len(feature_cols)}")
-    print(f"特徴量一覧: {feature_cols}")
-
     results = walk_forward_validation(
         step3_df, feature_cols, target_col=target_col, n_splits=n_splits,
     )
 
     fold_metrics = results["fold_metrics"]
-    print("\n--- フォールドごとの評価指標 ---")
-    print(fold_metrics[["fold", "n_train", "n_test",
-                        "label_1_rate_train", "label_1_rate_test",
-                        "accuracy", "precision", "recall", "f1", "roc_auc"]].to_string(index=False))
-
-    # Fold間のAUC標準偏差の計算と表示
     auc_std = fold_metrics["roc_auc"].std()
-    print(f"\nFold間 AUC標準偏差: {auc_std:.4f} (目安: 0.03以下が安定)")
     results["auc_std"] = auc_std
-
-    print("\n--- 平均スコア（全フォールド） ---")
-    print(fold_metrics[["accuracy", "precision", "recall", "f1", "roc_auc"]].mean())
-
-    print("\n--- 特徴量重要度 Top10 ---")
-    print(results["feature_importance"].head(10))
 
     return results
 
@@ -277,7 +260,4 @@ def save_step4_results(results: dict,
     results["oos_predictions"].to_csv(oos_predictions_path)
     joblib.dump(results["final_model"], model_path)
 
-    print(f"\nCSV保存完了: {fold_metrics_path}")
-    print(f"CSV保存完了: {feature_importance_path}")
-    print(f"CSV保存完了: {oos_predictions_path}")
-    print(f"モデル保存完了: {model_path}")
+

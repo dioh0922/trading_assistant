@@ -181,15 +181,4 @@ def build_step2_dataset(step1_df: pd.DataFrame,
     # --- 欠損値処理（Zスコアのウォームアップ期間を除去） ---
     d = d.dropna()
 
-    print(f"\nステップ2 最終データセット: {len(d)}行 × {len(d.columns)}列")
-    print("\nステップ2で追加された特徴量:")
-    new_cols = [
-        "dev_ma25_zscore", "dev_ma75_zscore", "oversold_flag", "overbought_flag",
-        "rsi_bullish_divergence", "rsi_divergence_strength",
-        "atr_dev_ma25", "is_overheated", "is_overbought_heat", "is_oversold_heat",
-        "pump_temporary_score", "is_likely_temporary_pump",
-    ]
-    for col in new_cols:
-        print(f"  {col}")
-
     return d

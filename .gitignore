@@ -5,3 +5,4 @@
 /resource/*.pkl
 /resource
 /report
+.env

@@ -186,15 +186,4 @@ def build_step5_dataset(df: pd.DataFrame,
     """
     d = generate_assist_signal(df, rsi_lookback=rsi_lookback, dev_lookback=dev_lookback)
 
-    print(f"\nステップ5 最終データセット: {len(d)}行 × {len(d.columns)}列")
-
-    print("\nシグナル分布:")
-    print(d["assist_signal"].value_counts().reindex(
-        [SIGNAL_BULLISH, SIGNAL_CAUTION, SIGNAL_NEUTRAL]
-    ))
-
-    summary = evaluate_signal_quality(d)
-    print("\nシグナル別の検証結果（勝率・平均リターンはトリプルバリア基準）:")
-    print(summary)
-
     return d

@@ -240,7 +240,6 @@ def main() -> None:
 
     # --- 結果出力先ディレクトリを作成 ---
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"結果出力先: {output_dir}\n")
 
     step1_output_path = output_dir / "step1_dataset.csv"
     step2_output_path = output_dir / "step2_dataset.csv"
@@ -248,27 +247,16 @@ def main() -> None:
     step5_output_path = output_dir / "step5_dataset.csv"
 
     # --- ステップ1: マルチタイムフレーム統合 ---
-    print("=" * 60)
-    print("ステップ1: データ収集とマルチタイムフレームの統合")
-    print("=" * 60)
     step1_df = build_step1_dataset(str(input_path))
     step1_df.to_csv(step1_output_path)
-    print(f"\nCSV保存完了: {step1_output_path}")
     plot_step1(step1_df, output_dir / "step1_chart.png")
 
     # --- ステップ2: ドメイン知識の注入 ---
-    print("\n" + "=" * 60)
-    print("ステップ2: 特徴量エンジニアリング（ドメイン知識の注入）")
-    print("=" * 60)
     step2_df = build_step2_dataset(step1_df)
     step2_df.to_csv(step2_output_path)
-    print(f"\nCSV保存完了: {step2_output_path}")
     plot_step2(step2_df, output_dir / "step2_chart.png")
 
     # --- ステップ3: ターゲット（ラベル）の設計 ---
-    print("\n" + "=" * 60)
-    print(f"ステップ3: ターゲット（ラベル）の設計 [バリアモード: {args.barrier_mode}]")
-    print("=" * 60)
     if args.barrier_mode == "fixed_pct":
         step3_df = build_step3_dataset(
             step2_df,
@@ -286,13 +274,9 @@ def main() -> None:
             drawdown_threshold=args.drawdown_threshold,
         )
     step3_df.to_csv(step3_output_path)
-    print(f"\nCSV保存完了: {step3_output_path}")
     plot_step3(step3_df, output_dir / "step3_chart.png")
 
     # --- ステップ4: モデル構築とバリデーション ---
-    print("\n" + "=" * 60)
-    print("ステップ4: モデル構築とバリデーション")
-    print("=" * 60)
     step4_results = build_step4_results(step3_df)
     save_step4_results(
         step4_results,
@@ -310,17 +294,9 @@ def main() -> None:
     )
 
     # --- ステップ5: アシストロジックの実装（3段階シグナル） ---
-    print("\n" + "=" * 60)
-    print("ステップ5: アシストロジックの実装（3段階シグナル）")
-    print("=" * 60)
     step5_df = build_step5_dataset(step3_df)
     step5_df.to_csv(step5_output_path)
-    print(f"\nCSV保存完了: {step5_output_path}")
     plot_step5(step5_df, output_dir / "step5_chart.png")
-
-    # --- 確認用: 先頭5行を表示 ---
-    print("\n--- ステップ5 先頭5行 ---")
-    print(step5_df[["close", "assist_signal"]].head())
 
     # --- ステップ6: 最終意思決定フィルタ ---
     if args.step6:
