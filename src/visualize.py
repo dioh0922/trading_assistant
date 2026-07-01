@@ -491,7 +491,8 @@ def plot_step5(df: pd.DataFrame, save_path: Path) -> None:
     ax_count.grid(alpha=0.3, axis="y")
 
     if has_labels:
-        summary = evaluate_signal_quality(df)
+        summary_dict = evaluate_signal_quality(df)
+        summary = summary_dict["signal_summary"] if isinstance(summary_dict, dict) else summary_dict
 
         # --- ③ シグナル別の勝率 ---
         ax_winrate.bar(summary.index, summary["勝率"],

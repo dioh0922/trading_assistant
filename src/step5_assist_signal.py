@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.step4_edge_analyzer import add_entry_score
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -107,9 +109,15 @@ def generate_assist_signal(df: pd.DataFrame,
                 f"特徴量エンジニアリング（ステップ1・2）が正しく実行されているか確認してください。"
             )
 
+    from src.custom_signals import detect_high_atr_bottoming
+
     rsi_reversal      = _detect_rsi_reversal(d, lookback=rsi_lookback)
     deviation_shrink   = _detect_deviation_shrinking(d, lookback=dev_lookback)
     overheat_warning   = _detect_overheat_warning(d)
+    high_atr_bottoming  = detect_high_atr_bottoming(d)
+
+    # Add flag for high_atr_bottoming
+    d["high_atr_bottoming_flag"] = high_atr_bottoming.astype(int)
 
     # 順張り型の強気条件を追加
     trending_bullish = (
@@ -118,19 +126,38 @@ def generate_assist_signal(df: pd.DataFrame,
         (d["volume_ratio"] >= 1.2)
     )
 
-    # 既存の逆張り強気条件と順張り強気条件のORを取る
-    bullish_cond = (rsi_reversal & deviation_shrink) | trending_bullish
+    # 押し目買い型の強気条件を追加 (週足上昇トレンド、RSI45未満、過熱なし)
+    pullback_cond = (
+        (d["weekly_trend"] == 1) &
+        (d["rsi14"] < 45) &
+        (d["atr_dev_ma25"] < 0.5)
+    )
+
+    # 既存の逆張り強気条件と順張り・押し目強気条件のORを取る
+    bullish_cond = (rsi_reversal & deviation_shrink) | trending_bullish | pullback_cond
 
     signal = np.where(
         overheat_warning, SIGNAL_CAUTION,
         np.where(bullish_cond, SIGNAL_BULLISH, SIGNAL_NEUTRAL),
     )
 
+    # シグナルの詳細分類 (signal_type)
+    sig_type = np.where(overheat_warning, "overheat",
+               np.where(high_atr_bottoming, "high_atr_bottoming",
+               np.where(trending_bullish, "trend_follow",
+               np.where(rsi_reversal & deviation_shrink, "reversal",
+               np.where(pullback_cond, "pullback", "none")))))
+
     d["rsi_reversal_flag"]   = rsi_reversal.astype(int)
     d["deviation_shrink_flag"] = deviation_shrink.astype(int)
     d["overheat_warning_flag"] = overheat_warning.astype(int)
     d["trending_bullish_flag"] = trending_bullish.astype(int)
+    d["pullback_flag"]         = pullback_cond.astype(int)
     d["assist_signal"] = signal
+    d["signal_type"] = sig_type
+
+    # entry_score の追加
+    d = add_entry_score(d)
 
     return d
 
@@ -139,34 +166,54 @@ def generate_assist_signal(df: pd.DataFrame,
 # 4. シグナルの妥当性検証（ステップ3のラベルと突き合わせ）
 # =============================================================================
 
-def evaluate_signal_quality(df: pd.DataFrame) -> pd.DataFrame:
+def evaluate_signal_quality(df: pd.DataFrame) -> dict:
     """
-    各シグナルが実際にどれくらい「当たっていたか」を、
-    ステップ3で計算済みのトリプルバリア結果（tb_label, tb_return）と
-    突き合わせて検証する。
-
-    強気シグナルが出た日のtb_label平均（=勝率に相当）が高いほど、
-    このルールベースロジックが機能していると言える。
-
-    ※ tb_label/tb_return が無いDataFrame（ステップ2出力のみ等）の場合は
-       シグナルの件数集計のみ返す。
+    各シグナルおよびシグナルタイプが実際にどれくらい「当たっていたか」を、
+    ステップ3で計算済みのトリプルバリア結果（tb_label, tb_return）や
+    最大ドローダウン等と突き合わせて検証する。
     """
     has_labels = "tb_label" in df.columns and "tb_return" in df.columns
-
+    
+    # 1. assist_signal ごとの集計
     if has_labels:
-        summary = df.groupby("assist_signal").agg(
-            件数=("assist_signal", "count"),
-            勝率=("tb_label", "mean"),
-            平均リターン=("tb_return", "mean"),
-        )
+        # ドローダウンデータもあれば平均最大DDも集計
+        dd_col = "forward_max_drawdown" if "forward_max_drawdown" in df.columns else None
+        
+        agg_dict = {
+            "件数": ("assist_signal", "count"),
+            "勝率": ("tb_label", "mean"),
+            "平均リターン": ("tb_return", "mean"),
+        }
+        if dd_col:
+            agg_dict["平均最大DD"] = (dd_col, "mean")
+            
+        summary_signal = df.groupby("assist_signal").agg(**agg_dict)
     else:
-        summary = df.groupby("assist_signal").agg(件数=("assist_signal", "count"))
-
-    # 表示順を固定（強気→警戒→中立）
-    order = [s for s in [SIGNAL_BULLISH, SIGNAL_CAUTION, SIGNAL_NEUTRAL] if s in summary.index]
-    summary = summary.reindex(order)
-
-    return summary
+        summary_signal = df.groupby("assist_signal").agg(件数=("assist_signal", "count"))
+        
+    order = [s for s in [SIGNAL_BULLISH, SIGNAL_CAUTION, SIGNAL_NEUTRAL] if s in summary_signal.index]
+    summary_signal = summary_signal.reindex(order)
+    
+    # 2. signal_type ごとの集計
+    summary_type = None
+    if "signal_type" in df.columns:
+        if has_labels:
+            agg_dict = {
+                "件数": ("signal_type", "count"),
+                "勝率": ("tb_label", "mean"),
+                "平均リターン": ("tb_return", "mean"),
+            }
+            if dd_col:
+                agg_dict["平均最大DD"] = (dd_col, "mean")
+                
+            summary_type = df.groupby("signal_type").agg(**agg_dict)
+        else:
+            summary_type = df.groupby("signal_type").agg(件数=("signal_type", "count"))
+            
+    return {
+        "signal_summary": summary_signal,
+        "type_summary": summary_type
+    }
 
 
 # =============================================================================

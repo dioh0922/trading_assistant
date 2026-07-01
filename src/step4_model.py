@@ -56,6 +56,7 @@ _EXCLUDE_COLS = {
     "tb_label", "avoid_entry_flag",
     # ターゲット生成の過程で使った未来情報（特徴量に混ぜると正解漏洩になる）
     "tb_barrier", "tb_days_to_touch", "tb_return", "forward_max_drawdown",
+    "trade_quality_label",
 }
 
 

@@ -75,6 +75,8 @@ def build_llm_prompt(
         atr_pct = atr_p * 100 if atr_p <= 1.0 else atr_p
         if atr_pct < 33:
             atr_desc = f"{atr_pct:.1f}% (低ボラティリティ)"
+        elif atr_pct >= 90:
+            atr_desc = f"{atr_pct:.1f}% (過熱・高ボラティリティ)"
         elif atr_pct > 66:
             atr_desc = f"{atr_pct:.1f}% (高ボラティリティ)"
         else:

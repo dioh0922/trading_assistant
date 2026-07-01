@@ -266,9 +266,18 @@ def build_step3_dataset(step2_df: pd.DataFrame,
         drawdown_threshold=drawdown_threshold,
     )
 
+    # --- 新ラベル: trade_quality_label (利確かつ低ドローダウン) ---
+    # 途中の最大ドローダウンが許容閾値内に収まった状態で「勝ち」判定になったものを 1 とする
+    d["trade_quality_label"] = np.where(
+        (d["tb_label"] == 1) & (d["forward_max_drawdown"] > -drawdown_threshold),
+        1,
+        0
+    )
+
     # --- 末尾 holding_period 日分は未来データ不足でラベル計算不可 → 除去 ---
-    d = d.dropna(subset=["tb_label", "avoid_entry_flag"])
+    d = d.dropna(subset=["tb_label", "avoid_entry_flag", "trade_quality_label"])
     d["tb_label"] = d["tb_label"].astype(int)
     d["avoid_entry_flag"] = d["avoid_entry_flag"].astype(int)
+    d["trade_quality_label"] = d["trade_quality_label"].astype(int)
 
     return d
