@@ -59,16 +59,26 @@
 import argparse
 import sys
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass # python < 3.7
+
 import pandas as pd
 
 from src.step1_feature_engineering import build_step1_dataset, RESOURCE_DIR
 from src.step2_domain_features import build_step2_dataset
 from src.step3_labeling import build_step3_dataset
 from src.step4_model import build_step4_results, save_step4_results
-from src.step5_assist_signal import build_step5_dataset
+from src.step5_assist_signal import build_step5_dataset, evaluate_signal_quality
 from src.step6_filter import train_drawdown_model, apply_final_filter, evaluate_final_performance
 from src.step7_entry_signal import build_entry_report, load_source_df, save_report
 from src.visualize import plot_step1, plot_step2, plot_step3, plot_step4, plot_step5
+from src.step10_prompt_builder import build_llm_prompt, save_prompt
+from src.step11_llm_client import call_llm, build_llm_report, save_llm_report
+from src.step4_edge_analyzer import save_edge_analysis
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +135,22 @@ def parse_args() -> argparse.Namespace:
         "--target-pct", type=float, default=None,
         help="[ステップ9] 目標上昇率を割合で指定（例: --target-pct 0.15 で +15%%）。"
              "--target-price と --target-pct はどちらか一方のみ指定してください。",
+    )
+    parser.add_argument(
+        "--build-prompt", action="store_true", default=False,
+        help="[ステップ10] 定量データを元にLLM用のプロンプトテキストを生成・保存する。"
+    )
+    parser.add_argument(
+        "--llm", action="store_true", default=False,
+        help="[ステップ11] LLM推論を実行して定性・定量ハイブリッド判断レポートを出力する。"
+    )
+    parser.add_argument(
+        "--llm-provider", type=str, default="mock",
+        help="[ステップ11] LLMプロバイダを指定する（mock, gemini, openaiなど）"
+    )
+    parser.add_argument(
+        "--use-ml", action="store_true", default=False,
+        help="機械学習モデルの学習および推論（従来のStep4/Step6 DDフィルタ）を実行する。省略時は統計分析・スコアリングで動きます。"
     )
 
     args = parser.parse_args()
@@ -276,65 +302,88 @@ def main() -> None:
     step3_df.to_csv(step3_output_path)
     plot_step3(step3_df, output_dir / "step3_chart.png")
 
-    # --- ステップ4: モデル構築とバリデーション ---
-    step4_results = build_step4_results(step3_df)
-    save_step4_results(
-        step4_results,
-        fold_metrics_path=output_dir / "step4_fold_metrics.csv",
-        feature_importance_path=output_dir / "step4_feature_importance.csv",
-        oos_predictions_path=output_dir / "step4_oos_predictions.csv",
-        model_path=output_dir / "step4_model.pkl",
-    )
-    plot_step4(
-        step4_results["fold_metrics"],
-        step4_results["feature_importance"],
-        step4_results["oos_predictions"],
-        step3_df,
-        output_dir / "step4_chart.png",
-    )
+    # --- ステップ4: 過去統計分析 または 機械学習モデル構築とバリデーション ---
+    if args.use_ml:
+        print("\n" + "=" * 60)
+        print("ステップ4: 機械学習モデルの構築とバリデーション")
+        print("=" * 60)
+        step4_results = build_step4_results(step3_df)
+        save_step4_results(
+            step4_results,
+            fold_metrics_path=output_dir / "step4_fold_metrics.csv",
+            feature_importance_path=output_dir / "step4_feature_importance.csv",
+            oos_predictions_path=output_dir / "step4_oos_predictions.csv",
+            model_path=output_dir / "step4_model.pkl",
+        )
+        plot_step4(
+            step4_results["fold_metrics"],
+            step4_results["feature_importance"],
+            step4_results["oos_predictions"],
+            step3_df,
+            output_dir / "step4_chart.png",
+        )
+    else:
+        print("\n" + "=" * 60)
+        print("ステップ4: 過去統計分析 (Edge Analyzer)")
+        print("=" * 60)
+        edge_results = save_edge_analysis(step3_df, output_dir)
+        print(f"スコア付きデータ保存完了: {edge_results['scored_dataset_path']}")
+        print(f"閾値レポート保存完了: {edge_results['threshold_report_path']}")
+        print(f"条件別統計保存完了: {edge_results['condition_stats_path']}")
+        dp = edge_results['default_performance']
+        print(f"  基準スコア3以上のパフォーマンス: 件数={dp['entry_count']}, 勝率={dp['win_rate']:.1%}, 平均リターン={dp['mean_return']:.2%}, PF={dp['profit_factor']:.2f}")
 
-    # --- ステップ5: アシストロジックの実装（3段階シグナル） ---
+    # --- ステップ5: アシストロジックの実装（3段階シグナル ＆ スコアリング） ---
     step5_df = build_step5_dataset(step3_df)
     step5_df.to_csv(step5_output_path)
     plot_step5(step5_df, output_dir / "step5_chart.png")
 
+    # シグナルの品質評価をCSV出力する
+    sig_quality = evaluate_signal_quality(step5_df)
+    if sig_quality["signal_summary"] is not None:
+        sig_quality["signal_summary"].to_csv(output_dir / "step5_signal_quality.csv")
+    if sig_quality["type_summary"] is not None:
+        sig_quality["type_summary"].to_csv(output_dir / "step5_type_quality.csv")
+
     # --- ステップ6: 最終意思決定フィルタ ---
     if args.step6:
-        # drawdown-prob-limit が 1.0 のときは ML フィルタ実質無効（ATR ルールのみ）
-        ml_enabled = args.drawdown_prob_limit < 1.0
-        mode_label = f"MLフィルタ有効 (閾値: {args.drawdown_prob_limit:.0%})" if ml_enabled else "ATRルールのみ (ML無効)"
+        # args.use_ml かつ drawdown-prob-limit < 1.0 のときのみ ML フィルタを動かす
+        ml_enabled = args.use_ml and (args.drawdown_prob_limit < 1.0)
+        mode_label = f"MLフィルタ有効 (閾値: {args.drawdown_prob_limit:.0%})" if ml_enabled else "スコアベースフィルタ (ML無効)"
         print("\n" + "=" * 60)
         print(f"ステップ6: 最終意思決定フィルタ [{mode_label}]")
         print("=" * 60)
 
-        from src.step4_model import select_feature_columns
-        feature_cols = select_feature_columns(step3_df)
-
-        # 1. ドローダウン予測モデルの学習と予測確率の取得
-        print("ドローダウン予測モデルを構築中...")
-        dd_results = train_drawdown_model(step3_df, feature_cols)
-        dd_pred_proba = dd_results["oos_predictions"]["dd_proba"]
+        dd_pred_proba = None
+        if ml_enabled:
+            from src.step4_model import select_feature_columns
+            feature_cols = select_feature_columns(step3_df)
+            print("ドローダウン予測モデルを構築中...")
+            dd_results = train_drawdown_model(step3_df, feature_cols)
+            dd_pred_proba = dd_results["oos_predictions"]["dd_proba"]
+            
+            # ドローダウン予測モデルを保存
+            dd_model_path = output_dir / "step6_dd_model.pkl"
+            import joblib
+            joblib.dump(dd_results["final_model"], dd_model_path)
+            print(f"ドローダウン予測モデル保存完了: {dd_model_path}")
 
         # 2. 最終フィルタの適用
         step6_df = apply_final_filter(
             step5_df,
             dd_pred_proba=dd_pred_proba,
-            dd_threshold=args.drawdown_prob_limit
+            dd_threshold=args.drawdown_prob_limit,
+            use_ml=args.use_ml
         )
 
         # 3. パフォーマンス評価と出力
-        evaluate_final_performance(step6_df)
+        step6_perf = evaluate_final_performance(step6_df)
+        step6_perf.to_csv(output_dir / "step6_trade_metrics.csv")
 
         # 4. CSVの保存
         step6_output_path = output_dir / "step6_dataset.csv"
         step6_df.to_csv(step6_output_path)
         print(f"\nCSV保存完了: {step6_output_path}")
-
-        # ドローダウン予測モデルを保存
-        dd_model_path = output_dir / "step6_dd_model.pkl"
-        import joblib
-        joblib.dump(dd_results["final_model"], dd_model_path)
-        print(f"ドローダウン予測モデル保存完了: {dd_model_path}")
 
     # ─────────────────────────────────────────────────────────
     # ステップ7: 今日のエントリー判断レポートを出力
@@ -353,6 +402,7 @@ def main() -> None:
     # ─────────────────────────────────────────────────────────
     # ステップ9: 目標額到達推定
     # ─────────────────────────────────────────────────────────
+    target_info = None
     if args.target_price is not None or args.target_pct is not None:
         from src.step9_target_estimator import (
             estimate_empirical, estimate_monte_carlo,
@@ -409,6 +459,13 @@ def main() -> None:
         mc_90 = mc.get("reach_prob", {}).get(90, 0)
         reaches = emp_90 > 0 or mc_90 > 0
 
+        target_info = {
+            "target_price": target_price,
+            "target_pct": target_pct,
+            "emp_prob_90d": emp_90,
+            "mc_prob_90d": mc_90
+        }
+
         emp_median = empirical.get("days_distribution", {}).get("median")
         mc_median = mc.get("days_distribution", {}).get("median")
         emp_days = f"{emp_median:.0f}日" if emp_median is not None else "-"
@@ -428,6 +485,39 @@ def main() -> None:
             f"    シグナル: {signal}\n"
             f"    レポート: {report_path}"
         )
+
+    # ─────────────────────────────────────────────────────────
+    # ステップ10・11: LLMプロンプトビルド & 推論 (モック対応)
+    # ─────────────────────────────────────────────────────────
+    if args.build_prompt or args.llm:
+        print("\n" + "=" * 60)
+        print("ステップ10: LLMプロンプトビルド")
+        print("=" * 60)
+
+        try:
+            src_df, _ = load_source_df(output_dir)
+            last_row = src_df.iloc[-1]
+        except (FileNotFoundError, IndexError) as e:
+            print(f"エラー: 最新の定量データをロードできませんでした。: {e}")
+            sys.exit(1)
+
+        prompt = build_llm_prompt(code_label, last_row, target_info)
+        prompt_path = save_prompt(prompt, output_dir)
+        print(f"プロンプト保存完了: {prompt_path}")
+
+        if args.llm:
+            print("\n" + "=" * 60)
+            print(f"ステップ11: LLM推論実行 (プロバイダ: {args.llm_provider})")
+            print("=" * 60)
+
+            q_decision = str(last_row.get("final_decision", last_row.get("assist_signal", "不明")))
+
+            llm_result = call_llm(prompt, provider=args.llm_provider)
+            llm_report = build_llm_report(code_label, llm_result, step7_decision=q_decision)
+
+            print(llm_report)
+            report_path = save_llm_report(llm_report, output_dir)
+            print(f"LLMレポート保存完了: {report_path}")
 
 
 if __name__ == "__main__":
