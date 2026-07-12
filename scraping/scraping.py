@@ -15,6 +15,10 @@ def main():
         print("対象の銘柄コードが target.txt に記載されていません。")
         return
 
+    # CSV出力用ディレクトリの作成
+    output_dir = "./csv"
+    os.makedirs(output_dir, exist_ok=True)
+
     for ticker in tickers:
         # 数字のみの場合は東証銘柄とみなして .T を付与
         yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
@@ -29,7 +33,7 @@ def main():
                 continue
                 
             # CSVファイルに書き出し
-            output_csv = f"{ticker}.csv"
+            output_csv = os.path.join(output_dir, f"{ticker}.csv")
             stock_data.to_csv(output_csv)
             print(f"成功: {output_csv} にデータを保存しました。")
         except Exception as e:
