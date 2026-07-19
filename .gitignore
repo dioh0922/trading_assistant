@@ -5,3 +5,10 @@
 /resource/[0-9][0-9][0-9][0-9].xlsx
 scraping/target.txt
 /scraping/csv
+/plan/*/*.md
+/plan/*.md
+/train/data
+/train/models
+/train/reports
+*.pyc
+/train/src/stock_ml.egg-info

@@ -1,0 +1,38 @@
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  features_dir: "data/features"
+  labels_dir: "data/labels"
+  datasets_dir: "data/datasets"
+
+features:
+  windows: [5, 20, 60]
+  rsi_period: 14
+  atr_period: 14
+
+labels:
+  task2:
+    upper_barrier: 0.10
+    lower_barrier: -0.05
+    time_barrier_days: 60
+  task3:
+    time_barrier_days: 60
+  task1:
+    horizon_days: 20
+    up_threshold: 0.03
+    down_threshold: -0.03
+
+split:
+  embargo_days: 10
+  purge_days: 60
+  time_holdout_months: 6
+  stock_holdout_ratio: 0.125
+  n_folds: 5
+
+model:
+  lightgbm:
+    objective: "multiclass"
+    learning_rate: 0.05
+    num_leaves: 63
+    n_estimators: 1000
+    early_stopping_rounds: 50

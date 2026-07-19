@@ -15,7 +15,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     exist_path = os.path.join(output_dir, "exist.txt")
 
-    for code in range(0, 10000):
+    for code in range(2561, 10000):
       ticker = f"{code:04d}"
       yf_ticker = f"{ticker}.T"
       STOCK = yf.Ticker(yf_ticker)
