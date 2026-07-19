@@ -11,6 +11,9 @@ from pipeline.features_single import build_features_single
 from pipeline.ingest import ingest_all
 from pipeline.labels import build_labels_task1, build_labels_task2, build_labels_task3
 from pipeline.quality_check import run_quality_check
+from pipeline.dataset_split import build_dataset_split
+from pipeline.train import run_training
+from pipeline.evaluate import run_evaluation
 
 log = logging.getLogger("run_pipeline")
 
@@ -107,6 +110,43 @@ def run_pipeline(
             labels_task3_path,
             max_days=config.labels.task3.time_barrier_days,
         )
+
+    # Phase 5: Dataset split
+    datasets_dir = Path(config.data.datasets_dir)
+    tasks = ["task1", "task2", "task3"]
+    for t in tasks:
+        dataset_path = datasets_dir / f"{t}_dataset.parquet"
+        if should_skip and dataset_path.exists():
+            log.info("Phase 5 %s [dataset_split]: skip (exists: %s)", t, dataset_path)
+        else:
+            log.info("Phase 5 %s [dataset_split]: labels_%s.parquet -> %s", t, t, dataset_path)
+            labels_path = labels_dir / f"labels_{t}.parquet"
+            features_path = features_cross_path if features_cross_path.exists() else features_single_path
+            build_dataset_split(
+                features_path=features_path,
+                labels_path=labels_path,
+                output_path=dataset_path,
+                config=config.split,
+            )
+
+    # Phase 6: Model training
+    train_tasks = ["task1", "task2", "task3_hit", "task3_days"]
+    for t in train_tasks:
+        metadata_path = Path("models") / t / "metadata.json"
+        if should_skip and metadata_path.exists():
+            log.info("Phase 6 %s [train]: skip (exists: %s)", t, metadata_path)
+        else:
+            log.info("Phase 6 %s [train]: training models...", t)
+            run_training(config_path, t)
+
+    # Phase 7: Evaluation
+    for t in train_tasks:
+        report_path = Path("reports") / f"{t}_evaluation.md"
+        if should_skip and report_path.exists():
+            log.info("Phase 7 %s [evaluate]: skip (exists: %s)", t, report_path)
+        else:
+            log.info("Phase 7 %s [evaluate]: generating evaluation report...", t)
+            run_evaluation(config_path, t)
 
     log.info("Pipeline complete")
 
