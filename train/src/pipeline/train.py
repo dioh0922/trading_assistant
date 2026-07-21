@@ -20,6 +20,7 @@ log = logging.getLogger("train")
 def build_train_eval_data(
     dataset_df: pl.DataFrame,
     task: str,
+    label_encoder: LabelEncoder | None = None,
 ) -> tuple[list[str], pl.DataFrame, LabelEncoder | None]:
     # Determine non-feature columns
     meta_cols = {
@@ -39,13 +40,17 @@ def build_train_eval_data(
     log.info("Features (%d): %s", len(feature_cols), feature_cols)
 
     # Process targets
-    le = None
+    le = label_encoder
     if task in ("task1", "task2"):
-        # Encode label strings to integers
-        le = LabelEncoder()
-        # Clean labels (no empty or null)
-        labels = dataset_df["label"].to_list()
-        encoded = le.fit_transform(labels)
+        if le is None:
+            # Encode label strings to integers
+            le = LabelEncoder()
+            # Clean labels (no empty or null)
+            labels = dataset_df["label"].to_list()
+            encoded = le.fit_transform(labels)
+        else:
+            labels = dataset_df["label"].to_list()
+            encoded = le.transform(labels)
         dataset_df = dataset_df.with_columns(pl.Series("target", encoded))
     elif task == "task3_hit":
         # Target: 1 if upper, 0 if timeout
@@ -85,31 +90,71 @@ def run_training(
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    log.info("Loading dataset from %s", dataset_path)
-    df = pl.read_parquet(dataset_path)
+    log.info("Loading dataset info from %s", dataset_path)
+    if dataset_path.is_file():
+        # Fallback for single file (e.g. in tests)
+        df = pl.read_parquet(dataset_path)
+        feature_cols, df, label_encoder = build_train_eval_data(df, task)
+        has_weights = "sample_weight" in df.columns
+        is_directory_split = False
+    else:
+        # Directory split (production memory-efficient mode)
+        stock_holdout_path = dataset_path / "stock_holdout.parquet"
+        time_holdout_path = dataset_path / "time_holdout.parquet"
+        if not stock_holdout_path.exists() or not time_holdout_path.exists():
+            raise FileNotFoundError(f"Dataset splits missing in {dataset_path}")
 
-    # Prepare features and target
-    feature_cols, df, label_encoder = build_train_eval_data(df, task)
-    if len(df) == 0:
-        log.error("Dataset after filtering is empty.")
-        return
+        sh_df = pl.read_parquet(stock_holdout_path)
+        th_df = pl.read_parquet(time_holdout_path)
+
+        # Determine feature columns
+        feature_cols, _, _ = build_train_eval_data(sh_df, task)
+        has_weights = "sample_weight" in sh_df.columns
+
+        # Build consistent label encoder if multiclass
+        label_encoder = None
+        if task in ("task1", "task2"):
+            # Gather all unique labels across holdouts to cover the entire space
+            sh_labels = sh_df["label"].unique().to_list()
+            th_labels = th_df["label"].unique().to_list()
+            unique_labels = sorted(list(set(sh_labels + th_labels)))
+            label_encoder = LabelEncoder()
+            label_encoder.fit(unique_labels)
+            log.info("Fit LabelEncoder with classes: %s", label_encoder.classes_)
+        is_directory_split = True
+        # メタデータ抽出後はsh_df/th_dfを解放
+        del sh_df, th_df
 
     n_folds = config.split.n_folds
     lgb_config = config.model.lightgbm
 
     importances = []
-    
-    # Check if sample_weight exists
-    has_weights = "sample_weight" in df.columns
 
     for k in range(n_folds):
         log.info("--- Fold %d / %d ---", k + 1, n_folds)
-        train_df = df.filter((pl.col("fold") == k) & (pl.col("split_type") == "train"))
-        valid_df = df.filter((pl.col("fold") == k) & (pl.col("split_type") == "valid"))
+        if is_directory_split:
+            train_path = dataset_path / f"fold_{k}_train.parquet"
+            valid_path = dataset_path / f"fold_{k}_valid.parquet"
 
-        if len(train_df) == 0:
-            log.warning("Fold %d train data is empty. Skipping.", k)
-            continue
+            if not train_path.exists():
+                log.warning("Fold %d train data does not exist. Skipping.", k)
+                continue
+
+            train_df = pl.read_parquet(train_path)
+            valid_df = pl.read_parquet(valid_path) if valid_path.exists() else pl.DataFrame()
+
+            _, train_df, _ = build_train_eval_data(train_df, task, label_encoder=label_encoder)
+            if len(train_df) == 0:
+                log.warning("Fold %d train data is empty. Skipping.", k)
+                continue
+
+        else:
+            # Fallback for single file
+            train_df = df.filter((pl.col("fold") == k) & (pl.col("split_type") == "train"))
+            valid_df = df.filter((pl.col("fold") == k) & (pl.col("split_type") == "valid"))
+            if len(train_df) == 0:
+                log.warning("Fold %d train data is empty. Skipping.", k)
+                continue
 
         X_train = train_df.select(feature_cols).to_pandas()
         y_train = train_df["target"].to_numpy()
@@ -150,6 +195,7 @@ def run_training(
         ]
         
         if len(valid_df) > 0:
+            _, valid_df, _ = build_train_eval_data(valid_df, task, label_encoder=label_encoder)
             X_val = valid_df.select(feature_cols).to_pandas()
             y_val = valid_df["target"].to_numpy()
             callbacks.append(early_stopping(stopping_rounds=lgb_config.early_stopping_rounds, verbose=False))

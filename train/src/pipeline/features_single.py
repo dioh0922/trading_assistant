@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
@@ -50,25 +51,76 @@ def compute_features_single(df: pl.DataFrame, windows: list[int], rsi_period: in
     return out
 
 
-def build_features_single(prices_path: Path, output_path: Path, windows: list[int] | None = None, rsi_period: int = 14, atr_period: int = 14) -> pl.DataFrame:
-    prices = pl.read_parquet(prices_path)
-    log.info("loaded %s (%d rows)", prices_path, len(prices))
+def build_features_single(
+    prices_path: Path,
+    output_path: Path,
+    windows: list[int] | None = None,
+    rsi_period: int = 14,
+    atr_period: int = 14,
+    chunk_size: int = 200,
+) -> None:
+    """銘柄ごとにfeatureを計算し逐次parquetへ書き込む（メモリ節約版）。
 
+    全銘柄分のDataFrameをpartsリストに蓄積してからpl.concatする実装は
+    ピーク時に「全銘柄の計算結果 × 2」のメモリを消費する。
+    本実装は chunk_size 銘柄ずつ処理してpyarrow ParquetWriterで
+    逐次アペンドするためピークメモリを大幅に削減できる。
+    """
     if windows is None:
         windows = [5, 20, 60]
 
-    parts: list[pl.DataFrame] = []
-    for ticker, group in prices.group_by("ticker"):
-        feat = compute_features_single(group, windows, rsi_period, atr_period)
-        parts.append(feat)
-
-    features = pl.concat(parts)
-    log.info("features: %d rows, %d columns", len(features), len(features.columns))
+    # --- スキーマ確認用に先頭1銘柄だけ読んでスキーマを確定する ---
+    tickers_all = (
+        pl.scan_parquet(prices_path)
+        .select("ticker")
+        .collect()
+        ["ticker"]
+        .unique()
+        .sort()
+        .to_list()
+    )
+    log.info("loaded ticker list: %d tickers from %s", len(tickers_all), prices_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    features.write_parquet(output_path)
-    log.info("wrote %s", output_path)
-    return features
+
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+
+    try:
+        for chunk_start in range(0, len(tickers_all), chunk_size):
+            chunk_tickers = tickers_all[chunk_start : chunk_start + chunk_size]
+            # チャンク分だけロード
+            chunk_df = (
+                pl.scan_parquet(prices_path)
+                .filter(pl.col("ticker").is_in(chunk_tickers))
+                .collect()
+            )
+
+            for ticker in chunk_tickers:
+                group = chunk_df.filter(pl.col("ticker") == ticker)
+                if len(group) == 0:
+                    continue
+                feat = compute_features_single(group, windows, rsi_period, atr_period)
+                arrow_table = feat.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
+                writer.write_table(arrow_table)
+                total_rows += len(feat)
+
+            log.info(
+                "features_single: processed %d/%d tickers, total rows so far: %d",
+                min(chunk_start + chunk_size, len(tickers_all)),
+                len(tickers_all),
+                total_rows,
+            )
+            # チャンクを明示的に解放
+            del chunk_df
+
+    finally:
+        if writer is not None:
+            writer.close()
+
+    log.info("wrote %s (%d rows)", output_path, total_rows)
 
 
 if __name__ == "__main__":

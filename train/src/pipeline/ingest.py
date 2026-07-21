@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
+from typing import Optional
 
 import polars as pl
+import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
@@ -60,31 +63,83 @@ def parse_single_csv(csv_path: Path) -> pl.DataFrame:
     return df
 
 
-def ingest_all(raw_dir: Path, output_path: Path, sample_tickers: int | None = None) -> pl.DataFrame:
+def ingest_all(
+    raw_dir: Path,
+    output_path: Path,
+    sample_tickers: Optional[int] = None,
+    extract_ratio: float = 0.0,
+    seed: int = 42,
+) -> tuple[None, list[str]]:
+    """全CSVを読み込みparquetへ変換する（メモリ節約版）。
+
+    全銘柄をframesリストに蓄積してからpl.concatするパターンは
+    ピーク時に「全データ × 2」のメモリを消費する。
+    本実装はpyarrow ParquetWriterで銀柄ごとに逐次アペンドするため
+    同時メモリ使用量を大幅に削減できる。
+
+    Args:
+        raw_dir: CSVファイルが格納されたディレクトリ。
+        output_path: 出力先parquetパス。
+        sample_tickers: 先頭N銘柄に絞る（Noneで全件）。
+        extract_ratio: ランダムに除外する銘柄の割合 (0.0〜1.0)。
+                       除外された銘柄はパイプラインの学習に使われず
+                       extract.txt に書き出される。
+        seed: ランダムシード（再現性確保用）。
+
+    Returns:
+        (None, extracted_tickers list)
+    """
     csv_paths = sorted(raw_dir.glob("*.csv"))
     if sample_tickers is not None:
         csv_paths = csv_paths[:sample_tickers]
     if not csv_paths:
         raise FileNotFoundError(f"No CSV files found in {raw_dir}")
 
-    frames: list[pl.DataFrame] = []
-    for p in csv_paths:
-        try:
-            frames.append(parse_single_csv(p))
-        except Exception as e:
-            log.warning("Failed to parse %s: %s", p.name, e)
-
-    if not frames:
-        raise RuntimeError("No CSV files were successfully parsed")
-
-    prices = pl.concat(frames)
-    n_tickers = prices["ticker"].n_unique()
-    log.info("ingest: %d tickers, %d rows", n_tickers, len(prices))
+    # extract_ratio に応じて銘柄をランダム除外
+    extracted_tickers: list[str] = []
+    if extract_ratio > 0.0:
+        all_stems = [p.stem for p in csv_paths]
+        rng = random.Random(seed)
+        n_extract = max(1, round(len(all_stems) * extract_ratio))
+        extracted_tickers = sorted(rng.sample(all_stems, n_extract))
+        extracted_set = set(extracted_tickers)
+        csv_paths = [p for p in csv_paths if p.stem not in extracted_set]
+        log.info(
+            "ingest: extract_ratio=%.2f → %d tickers excluded, %d tickers used",
+            extract_ratio,
+            len(extracted_tickers),
+            len(csv_paths),
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    prices.write_parquet(output_path)
+
+    # pyarrow ParquetWriter で銘柄ごとに逐次書き込み（フレームリストに全銘柄を蓄積しない）
+    writer: pq.ParquetWriter | None = None
+    n_tickers = 0
+    total_rows = 0
+    try:
+        for p in csv_paths:
+            try:
+                df = parse_single_csv(p)
+            except Exception as e:
+                log.warning("Failed to parse %s: %s", p.name, e)
+                continue
+            arrow_table = df.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
+            writer.write_table(arrow_table)
+            n_tickers += 1
+            total_rows += len(df)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if n_tickers == 0:
+        raise RuntimeError("No CSV files were successfully parsed")
+
+    log.info("ingest: %d tickers, %d rows", n_tickers, total_rows)
     log.info("wrote %s", output_path)
-    return prices
+    return None, extracted_tickers
 
 
 if __name__ == "__main__":

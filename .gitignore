@@ -12,3 +12,4 @@ scraping/target.txt
 /train/reports
 *.pyc
 /train/src/stock_ml.egg-info
+train/extract.txt

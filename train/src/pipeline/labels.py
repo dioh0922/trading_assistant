@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 
 log = logging.getLogger(__name__)
 
@@ -124,41 +125,48 @@ def build_labels_task1(
     horizon_days: int = 20,
     up_threshold: float = 0.03,
     down_threshold: float = -0.03,
-) -> pl.DataFrame:
+) -> None:
     prices = pl.read_parquet(prices_path)
     log.info("task1: loaded %d rows", len(prices))
 
-    parts: list[pl.DataFrame] = []
-    for ticker, group in prices.group_by("ticker"):
-        g = group.sort("date")
-        ret = g["close"].pct_change(horizon_days).to_numpy()
-        n = len(ret)
-
-        labels = np.empty(n, dtype="U10")
-        for i in range(n):
-            if np.isnan(ret[i]):
-                labels[i] = "unknown"
-            elif ret[i] >= up_threshold:
-                labels[i] = "up"
-            elif ret[i] <= down_threshold:
-                labels[i] = "down"
-            else:
-                labels[i] = "range"
-
-        df = g.select(["ticker", "date"]).clone()
-        df = df.with_columns([
-            pl.Series("label", labels),
-            pl.lit(horizon_days).alias("horizon_days"),
-        ])
-        parts.append(df)
-
-    result = pl.concat(parts)
-    result = result.filter(pl.col("label") != "unknown")
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result.write_parquet(output_path)
-    log.info("task1: wrote %s (%d rows)", output_path, len(result))
-    return result
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    try:
+        for ticker, group in prices.group_by("ticker"):
+            g = group.sort("date")
+            ret = g["close"].pct_change(horizon_days).to_numpy()
+            n = len(ret)
+
+            labels = np.empty(n, dtype="U10")
+            for i in range(n):
+                if np.isnan(ret[i]):
+                    labels[i] = "unknown"
+                elif ret[i] >= up_threshold:
+                    labels[i] = "up"
+                elif ret[i] <= down_threshold:
+                    labels[i] = "down"
+                else:
+                    labels[i] = "range"
+
+            df = g.select(["ticker", "date"]).clone()
+            df = df.with_columns([
+                pl.Series("label", labels),
+                pl.lit(horizon_days).alias("horizon_days"),
+            ])
+            df = df.filter(pl.col("label") != "unknown")
+            if len(df) == 0:
+                continue
+            arrow_table = df.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
+            writer.write_table(arrow_table)
+            total_rows += len(df)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    log.info("task1: wrote %s (%d rows)", output_path, total_rows)
 
 
 def build_labels_task2(
@@ -167,23 +175,28 @@ def build_labels_task2(
     upper: float = 0.10,
     lower: float = -0.05,
     max_days: int = 60,
-) -> pl.DataFrame:
+) -> None:
     prices = pl.read_parquet(prices_path)
     log.info("task2: loaded %d rows", len(prices))
 
-    parts: list[pl.DataFrame] = []
-    for ticker, group in prices.group_by("ticker"):
-        g = group.sort("date")
-        lbl = triple_barrier_label(g, upper=upper, lower=lower, max_days=max_days)
-        parts.append(lbl)
-
-    result = pl.concat(parts)
-    result = compute_sample_weights(result, max_days)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result.write_parquet(output_path)
-    log.info("task2: wrote %s (%d rows)", output_path, len(result))
-    return result
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    try:
+        for ticker, group in prices.group_by("ticker"):
+            g = group.sort("date")
+            lbl = triple_barrier_label(g, upper=upper, lower=lower, max_days=max_days)
+            lbl = compute_sample_weights(lbl, max_days)
+            arrow_table = lbl.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
+            writer.write_table(arrow_table)
+            total_rows += len(lbl)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    log.info("task2: wrote %s (%d rows)", output_path, total_rows)
 
 
 def build_labels_task3(
@@ -191,41 +204,41 @@ def build_labels_task3(
     output_path: Path,
     upper_pcts: list[float] | None = None,
     max_days: int = 60,
-) -> pl.DataFrame:
+) -> None:
     if upper_pcts is None:
         upper_pcts = [0.05, 0.10, 0.15, 0.20, 0.30]
 
     prices = pl.read_parquet(prices_path)
     log.info("task3: loaded %d rows, upper_pcts=%s", len(prices), upper_pcts)
 
-    all_parts: list[pl.DataFrame] = []
-    for ticker, group in prices.group_by("ticker"):
-        g = group.sort("date")
-        for pct in upper_pcts:
-            lbl = triple_barrier_label(g, upper=pct, lower=None, max_days=max_days)
-            lbl = lbl.with_columns([
-                pl.lit(pct).alias("target_return"),
-            ])
-            all_parts.append(lbl)
-
-    result = pl.concat(all_parts)
-
-    # 注意: target_returnごとに時間窓の重なり方が変わるため、
-    # sample_weightはtarget_return単位で分けて計算する
-    # （元の実装は全target_returnをまとめて渡していたため、
-    #   同一日付・同一銘柄の異なるtarget_return行同士まで「重複」として
-    #   数えてしまい、計算量が5倍に膨らむ上に重みの意味も歪んでいた）
-    weighted_parts = []
-    for pct in upper_pcts:
-        part = result.filter(pl.col("target_return") == pct)
-        part = compute_sample_weights(part, max_days)
-        weighted_parts.append(part)
-    result = pl.concat(weighted_parts)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result.write_parquet(output_path)
-    log.info("task3: wrote %s (%d rows)", output_path, len(result))
-    return result
+
+    # target_returnごとに流れ作業して逐次書き込む。
+    # 全target_return・全銘柄をall_partsに蓄積する元の実装は
+    # 「銘柄数 × 5」分のDataFrameが同時メモリに乗るため非常に重い。
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+
+    try:
+        for pct in upper_pcts:
+            for ticker, group in prices.group_by("ticker"):
+                g = group.sort("date")
+                lbl = triple_barrier_label(g, upper=pct, lower=None, max_days=max_days)
+                lbl = lbl.with_columns(pl.lit(pct).alias("target_return"))
+                lbl = compute_sample_weights(lbl, max_days)
+
+                arrow_table = lbl.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
+                writer.write_table(arrow_table)
+                total_rows += len(lbl)
+
+            log.info("task3: pct=%.2f done (%d rows)", pct, total_rows)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    log.info("task3: wrote %s (%d rows)", output_path, total_rows)
 
 
 if __name__ == "__main__":

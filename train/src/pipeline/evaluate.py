@@ -16,6 +16,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     roc_auc_score,
 )
+from sklearn.preprocessing import LabelEncoder
 
 from pipeline.config import load_config
 from pipeline.train import build_train_eval_data
@@ -232,14 +233,48 @@ def run_evaluation(
     dataset_path = datasets_dir / f"{dataset_name}_dataset.parquet"
 
     log.info("Loading dataset for evaluation: %s", dataset_path)
-    df = pl.read_parquet(dataset_path)
+    if dataset_path.is_file():
+        # Fallback for single parquet file (e.g. in tests)
+        df = pl.read_parquet(dataset_path)
 
-    # Re-apply the same pipeline target extraction logic to align labels
-    _, df, _ = build_train_eval_data(df, task)
+        # Build consistent label encoder if multiclass
+        label_encoder = None
+        if task in ("task1", "task2"):
+            unique_labels = sorted(df["label"].unique().to_list())
+            label_encoder = LabelEncoder()
+            label_encoder.fit(unique_labels)
+            log.info("Fit LabelEncoder for evaluation with classes: %s", label_encoder.classes_)
 
-    # Filter into time_holdout and stock_holdout
-    time_df = df.filter(pl.col("split_type") == "time_holdout")
-    stock_df = df.filter(pl.col("split_type") == "stock_holdout")
+        # Re-apply the same pipeline target extraction logic to align labels
+        _, df, _ = build_train_eval_data(df, task, label_encoder=label_encoder)
+
+        # Filter into time_holdout and stock_holdout
+        time_df = df.filter(pl.col("split_type") == "time_holdout")
+        stock_df = df.filter(pl.col("split_type") == "stock_holdout")
+    else:
+        # Directory split (production memory-efficient mode)
+        time_path = dataset_path / "time_holdout.parquet"
+        stock_path = dataset_path / "stock_holdout.parquet"
+
+        if not time_path.exists() or not stock_path.exists():
+            raise FileNotFoundError(f"Evaluation holdouts missing in {dataset_path}")
+
+        time_df = pl.read_parquet(time_path)
+        stock_df = pl.read_parquet(stock_path)
+
+        # Build consistent label encoder if multiclass
+        label_encoder = None
+        if task in ("task1", "task2"):
+            sh_labels = stock_df["label"].unique().to_list()
+            th_labels = time_df["label"].unique().to_list()
+            unique_labels = sorted(list(set(sh_labels + th_labels)))
+            label_encoder = LabelEncoder()
+            label_encoder.fit(unique_labels)
+            log.info("Fit LabelEncoder for evaluation with classes: %s", label_encoder.classes_)
+
+        # Re-apply the same pipeline target extraction logic to align labels
+        _, time_df, _ = build_train_eval_data(time_df, task, label_encoder=label_encoder)
+        _, stock_df, _ = build_train_eval_data(stock_df, task, label_encoder=label_encoder)
 
     log.info("Time holdout size: %d, Stock holdout size: %d", len(time_df), len(stock_df))
 

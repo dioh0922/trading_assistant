@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import logging
 from pathlib import Path
+from typing import Generator
 import numpy as np
 import polars as pl
 
@@ -22,27 +23,21 @@ def get_time_holdout_start(max_date: datetime.date, months: int) -> datetime.dat
     return datetime.date(y, m, d)
 
 
-def assign_splits(
-    features_df: pl.DataFrame,
-    labels_df: pl.DataFrame,
+def _compute_split_meta(
+    df: pl.DataFrame,
     config: SplitConfig,
-) -> pl.DataFrame:
-    # 1. Join features and labels
-    # Use 'ticker' and 'date' as key
-    df = features_df.join(labels_df, on=["ticker", "date"], how="inner")
-    if len(df) == 0:
-        log.warning("Joined dataset is empty.")
-        return pl.DataFrame()
-
-    # 2. Stock Holdout Split
+) -> dict:
+    """結合済みDataFrameからスプリット定義（メタ情報のみ）を計算する。
+    大きなDataFrameのコピーは作らず、ティッカーリストと日付境界だけを返す。
+    """
     tickers = df["ticker"].unique().to_list()
-    tickers.sort()  # Sort to ensure reproducibility with seed
+    tickers.sort()
     rng = np.random.default_rng(42)
     rng.shuffle(tickers)
 
     n_holdout = int(len(tickers) * config.stock_holdout_ratio)
-    stock_holdout_tickers = set(tickers[:n_holdout])
-    cv_tickers = set(tickers[n_holdout:])
+    stock_holdout_tickers = list(tickers[:n_holdout])
+    cv_tickers = list(tickers[n_holdout:])
     log.info(
         "Stock holdout: %d tickers, CV: %d tickers (Total: %d)",
         len(stock_holdout_tickers),
@@ -50,76 +45,143 @@ def assign_splits(
         len(tickers),
     )
 
-    # 3. Time Holdout Split
     max_date = df["date"].max()
     if isinstance(max_date, str):
-        # Convert if string
-        df = df.with_columns(pl.col("date").str.to_date())
-        max_date = df["date"].max()
-    
+        max_date = datetime.date.fromisoformat(max_date)
     time_holdout_start = get_time_holdout_start(max_date, config.time_holdout_months)
     log.info("Time holdout start date: %s (Max date: %s)", time_holdout_start, max_date)
 
-    # Label the whole dataset based on stock & time holdout first
-    # We will replicate data for folds later
-    stock_holdout_mask = pl.col("ticker").is_in(list(stock_holdout_tickers))
-    time_holdout_mask = (pl.col("ticker").is_in(list(cv_tickers))) & (pl.col("date") >= time_holdout_start)
-    cv_mask = (pl.col("ticker").is_in(list(cv_tickers))) & (pl.col("date") < time_holdout_start)
+    # CV用の日付リストを取得（dfのサブセットから）
+    cv_dates = (
+        df.filter(
+            pl.col("ticker").is_in(cv_tickers) & (pl.col("date") < time_holdout_start)
+        )["date"]
+        .unique()
+        .sort()
+        .to_list()
+    )
 
-    stock_holdout_df = df.filter(stock_holdout_mask).with_columns([
-        pl.lit(-1).alias("fold"),
-        pl.lit("stock_holdout").alias("split_type"),
-    ])
+    fold_boundaries = []
+    n_dates = len(cv_dates)
+    if n_dates >= config.n_folds:
+        step = n_dates // config.n_folds
+        for k in range(config.n_folds):
+            val_start_idx = k * step
+            val_end_idx = (k + 1) * step - 1 if k < config.n_folds - 1 else n_dates - 1
+            fold_boundaries.append({
+                "k": k,
+                "val_start": cv_dates[val_start_idx],
+                "val_end": cv_dates[val_end_idx],
+            })
+    else:
+        log.warning("Too few unique dates (%d) for %d folds; skipping CV folds.", n_dates, config.n_folds)
 
-    time_holdout_df = df.filter(time_holdout_mask).with_columns([
-        pl.lit(-1).alias("fold"),
-        pl.lit("time_holdout").alias("split_type"),
-    ])
+    return {
+        "stock_holdout_tickers": stock_holdout_tickers,
+        "cv_tickers": cv_tickers,
+        "time_holdout_start": time_holdout_start,
+        "fold_boundaries": fold_boundaries,
+        "purge_days": config.purge_days,
+        "embargo_days": config.embargo_days,
+    }
 
-    cv_base_df = df.filter(cv_mask)
-    if len(cv_base_df) == 0:
-        log.warning("No data left for CV after holdout splits.")
-        return pl.concat([stock_holdout_df, time_holdout_df])
 
-    # 4. Purged K-Fold
-    unique_dates = cv_base_df["date"].unique().sort().to_list()
-    n_dates = len(unique_dates)
-    if n_dates < config.n_folds:
-        raise ValueError(f"Too few unique dates ({n_dates}) for {config.n_folds} folds.")
+def _iter_splits(
+    df: pl.DataFrame | pl.LazyFrame,
+    meta: dict,
+) -> Generator[tuple[str, pl.DataFrame], None, None]:
+    """スプリット名とDataFrameを1件ずつyieldする（同時に複数を保持しない）。
 
-    step = n_dates // config.n_folds
-    fold_dfs = []
+    DataFrame / LazyFrame の両方を受け付け、LazyFrameの場合はcollectしてからyieldする。
+    """
+    _collect = (lambda x: x.collect()) if isinstance(df, pl.LazyFrame) else (lambda x: x)
 
-    for k in range(config.n_folds):
-        val_start_idx = k * step
-        val_end_idx = (k + 1) * step - 1 if k < config.n_folds - 1 else n_dates - 1
-        
-        val_start_date = unique_dates[val_start_idx]
-        val_end_date = unique_dates[val_end_idx]
+    stock_holdout_tickers = meta["stock_holdout_tickers"]
+    cv_tickers = meta["cv_tickers"]
+    time_holdout_start = meta["time_holdout_start"]
 
-        # Valid mask
-        val_mask = (pl.col("date") >= val_start_date) & (pl.col("date") <= val_end_date)
-        valid_chunk = cv_base_df.filter(val_mask).with_columns([
-            pl.lit(k).alias("fold"),
-            pl.lit("valid").alias("split_type"),
-        ])
-        fold_dfs.append(valid_chunk)
+    # stock holdout
+    chunk = _collect(
+        df.filter(pl.col("ticker").is_in(stock_holdout_tickers))
+        .with_columns([pl.lit(-1).alias("fold"), pl.lit("stock_holdout").alias("split_type")])
+    )
+    yield "stock_holdout", chunk
+    del chunk
 
-        # Train mask with purging and embargo
-        # train date must be:
-        # date < val_start_date - purge_days OR date > val_end_date + purge_days + embargo_days
-        train_before_limit = val_start_date - datetime.timedelta(days=config.purge_days)
-        train_after_limit = val_end_date + datetime.timedelta(days=config.purge_days + config.embargo_days)
+    # time holdout
+    chunk = _collect(
+        df.filter(
+            pl.col("ticker").is_in(cv_tickers) & (pl.col("date") >= time_holdout_start)
+        )
+        .with_columns([pl.lit(-1).alias("fold"), pl.lit("time_holdout").alias("split_type")])
+    )
+    yield "time_holdout", chunk
+    del chunk
 
-        train_mask = (pl.col("date") < train_before_limit) | (pl.col("date") > train_after_limit)
-        train_chunk = cv_base_df.filter(train_mask).with_columns([
-            pl.lit(k).alias("fold"),
-            pl.lit("train").alias("split_type"),
-        ])
-        fold_dfs.append(train_chunk)
+    # CV base（fold計算用）- 日付境界だけ使い、データ自体はここでは保持しない
+    for fold_info in meta["fold_boundaries"]:
+        k = fold_info["k"]
+        val_start = fold_info["val_start"]
+        val_end = fold_info["val_end"]
+        purge = meta["purge_days"]
+        embargo = meta["embargo_days"]
 
-    result_df = pl.concat([stock_holdout_df, time_holdout_df] + fold_dfs)
-    return result_df
+        # CVティッカー × time_holdout前 のデータのみ対象
+        cv_base_filter = (
+            pl.col("ticker").is_in(cv_tickers) & (pl.col("date") < time_holdout_start)
+        )
+
+        # valid
+        val_chunk = _collect(
+            df.filter(
+                cv_base_filter
+                & (pl.col("date") >= val_start)
+                & (pl.col("date") <= val_end)
+            )
+            .with_columns([pl.lit(k).alias("fold"), pl.lit("valid").alias("split_type")])
+        )
+        yield f"fold_{k}_valid", val_chunk
+        del val_chunk
+
+        # train (purge + embargo)
+        train_before = val_start - datetime.timedelta(days=purge)
+        train_after = val_end + datetime.timedelta(days=purge + embargo)
+        train_chunk = _collect(
+            df.filter(
+                cv_base_filter
+                & ((pl.col("date") < train_before) | (pl.col("date") > train_after))
+            )
+            .with_columns([pl.lit(k).alias("fold"), pl.lit("train").alias("split_type")])
+        )
+        yield f"fold_{k}_train", train_chunk
+        del train_chunk
+
+
+def generate_splits(
+    features_df: pl.DataFrame,
+    labels_df: pl.DataFrame,
+    config: SplitConfig,
+) -> dict[str, pl.DataFrame]:
+    """後方互換のためgenerate_splitsを残す（テスト・小規模用）。
+    大規模データにはbuild_dataset_splitを使うこと。
+    """
+    df = features_df.join(labels_df, on=["ticker", "date"], how="inner")
+    if len(df) == 0:
+        log.warning("Joined dataset is empty.")
+        return {}
+    meta = _compute_split_meta(df, config)
+    return {name: chunk for name, chunk in _iter_splits(df, meta)}
+
+
+def assign_splits(
+    features_df: pl.DataFrame,
+    labels_df: pl.DataFrame,
+    config: SplitConfig,
+) -> pl.DataFrame:
+    splits = generate_splits(features_df, labels_df, config)
+    if not splits:
+        return pl.DataFrame()
+    return pl.concat(list(splits.values()))
 
 
 def build_dataset_split(
@@ -128,20 +190,42 @@ def build_dataset_split(
     output_path: Path,
     config: SplitConfig,
 ) -> None:
-    log.info("Loading features from %s", features_path)
-    features_df = pl.read_parquet(features_path)
-    log.info("Loading labels from %s", labels_path)
-    labels_df = pl.read_parquet(labels_path)
+    """メモリ効率化版のデータセット分割。
 
-    log.info("Splitting dataset...")
-    result_df = assign_splits(features_df, labels_df, config)
+    features と labels を join した後、スプリットを1件ずつ計算・書き込み・解放する。
+    splitsの辞書に全スプリットを同時保持しないため、ピークメモリを大幅に削減できる。
+    """
+    log.info("Loading features from %s (lazy)", features_path)
+    # scan_parquetで必要列のみフィルタしてからcollect
+    features_lazy = pl.scan_parquet(features_path)
+    log.info("Loading labels from %s (lazy)", labels_path)
+    labels_lazy = pl.scan_parquet(labels_path)
 
-    if len(result_df) > 0:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        result_df.write_parquet(output_path)
-        log.info("Saved split dataset to %s (%d rows)", output_path, len(result_df))
-    else:
-        log.error("Failed to split dataset (empty result)")
+    log.info("Joining features and labels (lazy)...")
+    joined_lazy = features_lazy.join(labels_lazy, on=["ticker", "date"], how="inner")
+
+    # メタ情報計算のために最小限のカラムだけcollect
+    log.info("Collecting ticker/date metadata for split planning...")
+    meta_df = joined_lazy.select(["ticker", "date"]).collect()
+    if len(meta_df) == 0:
+        log.error("Joined dataset is empty. Aborting.")
+        return
+
+    # スプリット定義（メタ情報のみ）を計算
+    meta = _compute_split_meta(meta_df, config)
+    del meta_df  # メタ情報計算後は不要
+
+    if output_path.exists() and output_path.is_file():
+        output_path.unlink()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # スプリットを1件ずつcollect→書き込み（全データを一括collectせずLazyFrame→個別collectでピークメモリ削減）
+    for name, split_df in _iter_splits(joined_lazy, meta):
+        split_file = output_path / f"{name}.parquet"
+        split_df.write_parquet(split_file)
+        log.info("Saved split '%s' to %s (%d rows)", name, split_file, len(split_df))
+
+    log.info("Saved split dataset directory to %s", output_path)
 
 
 if __name__ == "__main__":
@@ -158,3 +242,4 @@ if __name__ == "__main__":
 
     app_config = load_config(args.config)
     build_dataset_split(args.features, args.labels, args.output, app_config.split)
+

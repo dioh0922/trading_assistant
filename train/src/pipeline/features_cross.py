@@ -73,6 +73,8 @@ def build_features_cross(
     log.info("loaded prices_clean (%d rows)", len(prices_clean))
 
     features = compute_cross_sectional(features_single, prices_clean)
+    # 入力DataFrameを解放（compute_cross_sectional内で参照が残っていないため安全）
+    del features_single, prices_clean
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features.write_parquet(output_path)

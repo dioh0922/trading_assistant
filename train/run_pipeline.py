@@ -23,6 +23,9 @@ def run_pipeline(
     sample_tickers: int | None = None,
     skip_existing: bool = False,
     force: bool = False,
+    extract_ratio: float = 0.0,
+    extract_seed: int = 42,
+    extract_output: Path = Path("extract.txt"),
 ) -> None:
     config = load_config(config_path)
 
@@ -47,7 +50,21 @@ def run_pipeline(
         log.info("Phase 1 [ingest]: skip (exists: %s)", prices_path)
     else:
         log.info("Phase 1 [ingest]: CSV -> %s", prices_path)
-        ingest_all(raw_dir, prices_path, sample_tickers=sample_tickers)
+        _, extracted_tickers = ingest_all(
+            raw_dir,
+            prices_path,
+            sample_tickers=sample_tickers,
+            extract_ratio=extract_ratio,
+            seed=extract_seed,
+        )
+        if extracted_tickers:
+            extract_output.parent.mkdir(parents=True, exist_ok=True)
+            extract_output.write_text("\n".join(extracted_tickers) + "\n", encoding="utf-8")
+            log.info(
+                "Phase 1 [ingest]: %d tickers excluded -> %s",
+                len(extracted_tickers),
+                extract_output,
+            )
 
     # Phase 2
     if should_skip and prices_clean_path.exists():
@@ -157,6 +174,24 @@ def main() -> None:
     parser.add_argument("--sample-tickers", type=int, default=None, help="limit to first N tickers")
     parser.add_argument("--skip-existing", action="store_true", default=False, help="skip phases with existing output")
     parser.add_argument("--force", action="store_true", default=False, help="re-run even with --skip-existing")
+    parser.add_argument(
+        "--extract-ratio",
+        type=float,
+        default=0.0,
+        help="ランダムに除外する銘柄の割合 (0.0〜1.0, デフォルト: 0.0=除外なし)。例: 0.05 で5%%を除外",
+    )
+    parser.add_argument(
+        "--extract-seed",
+        type=int,
+        default=42,
+        help="除外銘柄選択のランダムシード (デフォルト: 42)",
+    )
+    parser.add_argument(
+        "--extract-output",
+        type=Path,
+        default=Path("extract.txt"),
+        help="除外銘柄を書き出すファイルパス (デフォルト: extract.txt)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -170,6 +205,9 @@ def main() -> None:
             sample_tickers=args.sample_tickers,
             skip_existing=args.skip_existing,
             force=args.force,
+            extract_ratio=args.extract_ratio,
+            extract_seed=args.extract_seed,
+            extract_output=args.extract_output,
         )
     except Exception:
         log.exception("Pipeline failed")

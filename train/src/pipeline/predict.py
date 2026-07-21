@@ -117,11 +117,13 @@ def predict_trend(
     probas = [m.predict_proba(X) for m in models]
     avg_proba = np.mean(probas, axis=0)[0]
 
+    LABEL_MAP = {"up": "上昇 (up)", "down": "下落 (down)", "range": "横ばい (range)"}
     print(f"\n[トレンド予測 (Task 1)]")
     print(f"銘柄: {ticker} (最新日付: {latest_date}, 終値: {latest_close:.1f}円)")
     print("-" * 50)
     for cls, p in sorted(zip(classes, avg_proba), key=lambda x: -x[1]):
-        print(f"  {cls:<10s}: {p * 100:5.1f}%")
+        label = LABEL_MAP.get(cls, cls)
+        print(f"  {label:<15s}: {p * 100:5.1f}%")
     print("-" * 50)
 
 
