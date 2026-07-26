@@ -46,6 +46,13 @@ from sklearn.metrics import (
     f1_score,
 )
 
+import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("evaluate_holdout")
 
@@ -249,41 +256,73 @@ def report_confidence_sweep(
     pred_label = classes[pred_idx]
     confidence = proba[np.arange(len(proba)), pred_idx]
 
+    label_order = sorted(classes.tolist())
+
     rows = []
     for t in thresholds:
         mask = confidence >= t
         coverage = float(mask.mean())
         n = int(mask.sum())
+
+        row = {"threshold": t, "coverage": coverage, "n_samples": n}
+
         if n == 0:
-            rows.append({"threshold": t, "coverage": coverage, "n_samples": n,
-                         "accuracy": np.nan, "macro_f1": np.nan, "upper_precision": np.nan})
+            row["accuracy"] = np.nan
+            row["macro_f1"] = np.nan
+            for lbl in label_order:
+                row[f"n_pred_{lbl}"] = 0
+                row[f"precision_{lbl}"] = np.nan
+            rows.append(row)
             continue
 
         acc = accuracy_score(y_true_arr[mask], pred_label[mask])
         macro_f1 = f1_score(y_true_arr[mask], pred_label[mask], average="macro", zero_division=0)
+        row["accuracy"] = acc
+        row["macro_f1"] = macro_f1
 
-        upper_mask = mask & (pred_label == upper_label)
-        upper_precision = (
-            float((y_true_arr[upper_mask] == upper_label).mean()) if upper_mask.sum() > 0 else np.nan
-        )
+        # クラスごとに「そのクラスと予測した件数」と「その予測の的中率(precision)」を出す。
+        # これがないと、例えば upper_precision=1.000 の母数が10件なのか10万件なのか判断できない。
+        for lbl in label_order:
+            pred_lbl_mask = mask & (pred_label == lbl)
+            n_pred = int(pred_lbl_mask.sum())
+            row[f"n_pred_{lbl}"] = n_pred
+            row[f"precision_{lbl}"] = (
+                float((y_true_arr[pred_lbl_mask] == lbl).mean()) if n_pred > 0 else np.nan
+            )
 
-        rows.append({
-            "threshold": t, "coverage": coverage, "n_samples": n,
-            "accuracy": acc, "macro_f1": macro_f1, "upper_precision": upper_precision,
-        })
+        rows.append(row)
 
     sweep_df = pd.DataFrame(rows)
 
     lines.append("## 2. 確信度フィルタ（confidence threshold sweep）")
     lines.append("")
-    lines.append("| threshold | coverage(残存率) | n_samples | accuracy | macro_f1 | upper_precision |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("### 2a. 全体サマリー")
+    lines.append("")
+    lines.append("| threshold | coverage(残存率) | n_samples | accuracy | macro_f1 |")
+    lines.append("|---|---|---|---|---|")
     for _, r in sweep_df.iterrows():
-        upper_precision_str = "-" if pd.isna(r["upper_precision"]) else f"{r['upper_precision']:.3f}"
         lines.append(
             f"| {r['threshold']:.2f} | {r['coverage']*100:.1f}% | {int(r['n_samples'])} | "
-            f"{r['accuracy']:.3f} | {r['macro_f1']:.3f} | {upper_precision_str} |"
+            f"{r['accuracy']:.3f} | {r['macro_f1']:.3f} |"
         )
+    lines.append("")
+
+    lines.append("### 2b. クラス別の予測件数とprecision（母数の確認用）")
+    lines.append("")
+    lines.append("**重要**: `precision_upper=1.000`のような数字が出ても、`n_pred_upper`（その閾値でupperと")
+    lines.append("予測された件数）が小さければ統計的に意味を持たない可能性が高い。必ず件数とセットで見ること。")
+    lines.append("")
+    header_cols = ["threshold"] + [f"n_pred_{lbl}" for lbl in label_order] + [f"precision_{lbl}" for lbl in label_order]
+    lines.append("| " + " | ".join(header_cols) + " |")
+    lines.append("|" + "---|" * len(header_cols))
+    for _, r in sweep_df.iterrows():
+        cells = [f"{r['threshold']:.2f}"]
+        for lbl in label_order:
+            cells.append(str(int(r[f"n_pred_{lbl}"])))
+        for lbl in label_order:
+            p = r[f"precision_{lbl}"]
+            cells.append("-" if pd.isna(p) else f"{p:.3f}")
+        lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
     valid = sweep_df.dropna(subset=["accuracy"])
@@ -293,6 +332,21 @@ def report_confidence_sweep(
         else:
             lines.append("→ 閾値を上げてもaccuracyが単調には改善していません。キャリブレーションの確認を推奨します。")
     lines.append("")
+
+    # upper（利確）予測の件数が閾値を上げるにつれてどれだけ減るかを明示的に警告する
+    if f"n_pred_{upper_label}" in sweep_df.columns:
+        max_n_upper = sweep_df[f"n_pred_{upper_label}"].max()
+        high_threshold_rows = sweep_df[sweep_df["threshold"] >= 0.8]
+        if not high_threshold_rows.empty:
+            min_n_upper_high = high_threshold_rows[f"n_pred_{upper_label}"].min()
+            if max_n_upper > 0 and min_n_upper_high < max_n_upper * 0.05:
+                lines.append(
+                    f"⚠ 注意: 閾値0.8以上では『{upper_label}』と予測される件数が"
+                    f"最大{int(max_n_upper)}件から{int(min_n_upper_high)}件まで減っています。"
+                    f"precisionの高さだけを見て『高確信度の利確シグナルは信頼できる』と判断せず、"
+                    f"実運用でその件数が意味のある頻度で発生するか（銘柄軸で見ても偏っていないか）を確認すること。"
+                )
+                lines.append("")
 
     return sweep_df
 
@@ -308,6 +362,7 @@ def run(
     label_col: str,
     thresholds: list[float],
     report_out: Path | None,
+    table_out: Path | None = None,
 ) -> None:
     metadata = load_metadata(model_dir)
     feature_columns = metadata["feature_columns"]
@@ -333,7 +388,7 @@ def run(
     lines.append("")
 
     report_basic_metrics(y_true, y_pred, lines)
-    report_confidence_sweep(y_true, proba, classes, thresholds, lines)
+    sweep_df = report_confidence_sweep(y_true, proba, classes, thresholds, lines)
 
     report_text = "\n".join(lines)
     print(report_text)
@@ -342,6 +397,24 @@ def run(
         report_out.parent.mkdir(parents=True, exist_ok=True)
         report_out.write_text(report_text, encoding="utf-8")
         log.info("report written to %s", report_out)
+
+    if table_out is not None:
+        table_out.parent.mkdir(parents=True, exist_ok=True)
+        table = {}
+        label_order = sorted(classes.tolist())
+        for lbl in label_order:
+            table[lbl] = {}
+            for _, r in sweep_df.iterrows():
+                th_str = f"{r['threshold']:.2f}"
+                p = r[f"precision_{lbl}"]
+                support = int(r[f"n_pred_{lbl}"])
+                table[lbl][th_str] = {
+                    "precision": float(p) if not pd.isna(p) else None,
+                    "support": support
+                }
+        with open(table_out, "w", encoding="utf-8") as f:
+            json.dump(table, f, indent=2, ensure_ascii=False)
+        log.info("reliability table written to %s", table_out)
 
 
 def main() -> None:
@@ -355,6 +428,7 @@ def main() -> None:
     parser.add_argument("--label-col", type=str, default="label", help="正解ラベルの列名")
     parser.add_argument("--thresholds", type=str, default="0.5,0.6,0.7,0.8,0.9")
     parser.add_argument("--report-out", type=Path, default=None)
+    parser.add_argument("--table-out", type=Path, default=None, help="校正テーブルJSONの出力先パス")
     args = parser.parse_args()
 
     thresholds = [float(t) for t in args.thresholds.split(",")]
@@ -367,6 +441,7 @@ def main() -> None:
         label_col=args.label_col,
         thresholds=thresholds,
         report_out=args.report_out,
+        table_out=args.table_out,
     )
 
 

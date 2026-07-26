@@ -1,19 +1,26 @@
 import os
+import csv
 from datetime import datetime
 import yfinance as yf
 
 def main():
-    target_file = "target.txt"
-    if not os.path.exists(target_file):
-        print(f"エラー: {target_file} が見つかりません。")
+    # positions.csv のパス（../train/positions.csv）を設定
+    positions_file = os.path.join(os.path.dirname(__file__), "..", "train", "positions.csv")
+    if not os.path.exists(positions_file):
+        print(f"エラー: {positions_file} が見つかりません。")
         return
 
-    # target.txt から銘柄コードを読み込む
-    with open(target_file, "r", encoding="utf-8") as f:
-        tickers = [line.strip() for line in f if line.strip()]
+    tickers = []
+    # positions.csv から銘柄コード (code列) を読み込む
+    with open(positions_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            code = row.get("code")
+            if code:
+                tickers.append(code.strip())
 
     if not tickers:
-        print("対象の銘柄コードが target.txt に記載されていません。")
+        print("対象の銘柄コードが positions.csv に記載されていません。")
         return
 
     # CSV出力用ディレクトリの作成

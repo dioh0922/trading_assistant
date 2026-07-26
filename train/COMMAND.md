@@ -82,6 +82,83 @@ python collect.py
 python scraping.py
 ```
 
+## 銘柄軸ホールドアウト評価（evaluate_holdout.py）
+
+```bash
+cd /app/train
+
+# 銘柄軸ホールドアウト評価の実行と校正テーブルの生成
+python evaluate_holdout.py \
+    --model-dir models/task2 \
+    --dataset-path data/datasets/task2_dataset.parquet \
+    --split-col split_type \
+    --split-value stock_holdout \
+    --label-col label \
+    --thresholds 0.5,0.6,0.7,0.8,0.9 \
+    --report-out reports/holdout_eval.md \
+    --table-out reliability_table.json
+```
+
+引数:
+| 引数 | デフォルト | 説明 |
+|------|-----------|------|
+| `--model-dir` | (必須) | fold*.joblib + metadata.jsonがあるディレクトリ |
+| `--dataset-path` | (必須) | 特徴量・ラベル・split列を持つデータセットパス |
+| `--split-col` | `split_type` | split種別が入っている列名 |
+| `--split-value` | `stock_holdout` | 評価対象とするsplitの値 |
+| `--label-col` | `label` | 正解ラベルの列名 |
+| `--thresholds` | `0.5,0.6,0.7,0.8,0.9` | 確信度の閾値リスト（カンマ区切り） |
+| `--report-out` | `None` | レポートの出力先パス |
+| `--table-out` | `None` | 校正テーブルJSONの出力先パス |
+
+## ポジションの一括チェック (check_positions.py)
+
+```bash
+cd /app/train
+
+# 毎日の保有ポジション一括チェックとレポート生成
+python -m src.pipeline.check_positions \
+    --positions positions.csv \
+    --model-dir models/task2 \
+    --reliability-table reliability_table.json \
+    --report-out reports/daily_check.md
+```
+
+引数:
+| 引数 | デフォルト | 説明 |
+|------|-----------|------|
+| `--positions` | `positions.csv` | 保有ポジション情報CSVのパス |
+| `--model-dir` | `models/task2` | Task 2アンサンブルモデルが格納されているディレクトリ |
+| `--reliability-table` | `reliability_table.json` | 確信度・精度の校正テーブルJSONのパス |
+| `--report-out` | `reports/daily_check.md` | 一括チェックレポートMarkdownの出力先パス |
+| `--config` | `config/config.yaml` | 設定ファイルYAMLのパス |
+| `--data-dir` | `None` | 特徴量データディレクトリ (指定がない場合は config の設定に基づく) |
+
+## 個別深掘り用データの作成 (analyze_ticker.py)
+
+```bash
+cd /app/train
+
+# 特定銘柄の詳細予測・特徴量分析データの出力 (JSON)
+python -m src.pipeline.analyze_ticker \
+    --ticker 6981 \
+    --entry-price 9066.0 \
+    --model-dir models/task2 \
+    --reliability-table reliability_table.json \
+    --out-json reports/6981_detail.json
+```
+
+引数:
+| 引数 | デフォルト | 説明 |
+|------|-----------|------|
+| `--ticker` | (必須) | 分析対象の銘柄コード |
+| `--entry-price` | `None` | ポジション取得価格 (指定すると含み損益を計算) |
+| `--model-dir` | `models/task2` | Task 2アンサンブルモデルが格納されているディレクトリ |
+| `--reliability-table` | `reliability_table.json` | 確信度・精度の校正テーブルJSONのパス |
+| `--out-json` | `reports/{ticker}_detail.json` | 出力先JSONパス (実際にはファイル名末尾にタイムスタンプが付与されます) |
+| `--config` | `config/config.yaml` | 設定ファイルYAMLのパス |
+| `--data-dir` | `None` | 特徴量データディレクトリ (指定がない場合は config の設定に基づく) |
+
 ## テスト
 
 ```bash
