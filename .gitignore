@@ -13,3 +13,5 @@ scraping/target.txt
 *.pyc
 /train/src/stock_ml.egg-info
 train/extract.txt
+train/positions.csv
+train/reliability_table.json

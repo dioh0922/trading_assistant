@@ -16,38 +16,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("check_positions")
 
 
-def get_nearest_reliability(
+def lookup_reliability(
     table: dict, label: str, confidence: float
 ) -> tuple[float | None, int]:
     """
-    reliability_table.json から指定したラベルと確信度に最も近い閾値の precision と support を取得する。
+    reliability_table.json から指定したラベルにおいて、
+    confidence以下の最大しきい値バケットの precision と support を取得する。
+    該当するしきい値が1つもない（テーブルの最小しきい値未満）の場合は (None, 0) を返す。
     """
     if label not in table:
         return None, 0
     
     label_data = table[label]
-    thresholds = []
-    for k in label_data.keys():
+    applicable = []
+    for k, info in label_data.items():
         try:
-            thresholds.append(float(k))
+            th = float(k)
+            # しきい値が確信度以下、かつ母数が1以上存在する場合に対象とする
+            if th <= confidence and info.get("support", 0) > 0:
+                applicable.append((th, info))
         except ValueError:
             continue
             
-    if not thresholds:
+    if not applicable:
         return None, 0
         
-    # 最も近い閾値を見つける
-    nearest_threshold = min(thresholds, key=lambda x: abs(x - confidence))
-    threshold_str = f"{nearest_threshold:.2f}"
-    
-    # 万が一文字列キーが一致しない場合のためのフォールバック
-    if threshold_str not in label_data:
-        # キーの浮動小数点表現で最も近いものを探す
-        closest_key = min(label_data.keys(), key=lambda k: abs(float(k) - confidence))
-        threshold_str = closest_key
-        
-    data = label_data[threshold_str]
-    return data.get("precision"), data.get("support", 0)
+    # confidenceに最も近い（＝最大の）しきい値を採用
+    best_threshold, best_info = max(applicable, key=lambda x: x[0])
+    return best_info.get("precision"), best_info.get("support", 0)
 
 
 def analyze_positions(
@@ -116,22 +112,28 @@ def analyze_positions(
             unrealized_return = (latest_close - entry_price) / entry_price
             
             # 過去精度情報の取得
-            precision, support = get_nearest_reliability(reliability_table, predicted_label, confidence)
+            precision, support = lookup_reliability(reliability_table, predicted_label, confidence)
             
             # 注意フラグ（flag）の判定
             flags = []
             
-            # 予測に基づくアラート
+            # 1. 予測に基づくアラート (閾値 0.65)
             if predicted_label == "lower" and confidence >= 0.65:
                 flags.append("🚨損切り警戒")
             elif predicted_label == "upper" and confidence >= 0.65:
                 flags.append("✨利確検討")
                 
-            # 実損益に基づくアラート
+            # 2. 実損益に基づくアラート
             if unrealized_return >= 0.08:
                 flags.append("📈利確目安到達")
             elif unrealized_return <= -0.04:
                 flags.append("📉損切り目安到達")
+                
+            # 3. 予測と実損益の相反（矛盾）チェック
+            if unrealized_return >= 0.08 and predicted_label == "lower":
+                flags.append("⚠️含み益到達も予測は下落方向（反落リスクに留意）")
+            elif unrealized_return <= -0.04 and predicted_label == "upper":
+                flags.append("⚠️含み損到達も予測は上昇方向（回復の可能性）")
                 
             # 母数警告
             support_note = ""
@@ -203,7 +205,7 @@ def analyze_positions(
             if r["status"] == "success":
                 ret_str = f"{r['unrealized_return']*100:+.2f}%"
                 conf_str = f"{r['confidence']*100:.1f}%"
-                prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "-"
+                prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "校正データなし"
                 supp_note = f" ({r['support_note']})" if r["support_note"] else ""
                 report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str}{supp_note} | {r['flag']} |")
             else:
@@ -218,7 +220,7 @@ def analyze_positions(
         if r["status"] == "success":
             ret_str = f"{r['unrealized_return']*100:+.2f}%"
             conf_str = f"{r['confidence']*100:.1f}%"
-            prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "-"
+            prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "校正データなし"
             supp_note = f" {r['support_note']}" if r["support_note"] else ""
             report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str} ({r['support']}){supp_note} | {r['flag']} | {r['date']} |")
         else:
