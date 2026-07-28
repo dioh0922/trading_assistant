@@ -10,41 +10,11 @@ import polars as pl
 
 from pipeline.config import load_config
 from pipeline.predict import load_ensemble_models, get_latest_features
+from pipeline.reliability import load_reliability_table, lookup_reliability
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("analyze_ticker")
-
-
-def get_nearest_reliability(
-    table: dict, label: str, confidence: float
-) -> tuple[float | None, int]:
-    """
-    reliability_table.json から指定したラベルと確信度に最も近い閾値の precision と support を取得する。
-    """
-    if label not in table:
-        return None, 0
-    
-    label_data = table[label]
-    thresholds = []
-    for k in label_data.keys():
-        try:
-            thresholds.append(float(k))
-        except ValueError:
-            continue
-            
-    if not thresholds:
-        return None, 0
-        
-    nearest_threshold = min(thresholds, key=lambda x: abs(x - confidence))
-    threshold_str = f"{nearest_threshold:.2f}"
-    
-    if threshold_str not in label_data:
-        closest_key = min(label_data.keys(), key=lambda k: abs(float(k) - confidence))
-        threshold_str = closest_key
-        
-    data = label_data[threshold_str]
-    return data.get("precision"), data.get("support", 0)
 
 
 def load_feature_importance(model_dir: Path, feature_cols: list[str], models: list) -> dict[str, float]:
@@ -90,13 +60,7 @@ def analyze_ticker(
     classes = metadata["label_classes"]
     barrier_config = metadata.get("barrier_config", {})
     
-    log.info("Loading reliability table from %s", reliability_path)
-    if reliability_path.exists():
-        with open(reliability_path, "r", encoding="utf-8") as f:
-            reliability_table = json.load(f)
-    else:
-        log.warning("Reliability table not found.")
-        reliability_table = {}
+    reliability_table = load_reliability_table(reliability_path)
         
     config = load_config(config_path)
     
@@ -120,7 +84,7 @@ def analyze_ticker(
     proba_map = {cls: float(p) for cls, p in zip(classes, avg_proba)}
     
     # 過去精度の取得
-    precision, support = get_nearest_reliability(reliability_table, predicted_label, confidence)
+    precision, support = lookup_reliability(reliability_table, predicted_label, confidence)
     
     # 4. 含み損益状況の計算
     unrealized_return = None

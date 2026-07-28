@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from pathlib import Path
 import datetime
@@ -10,40 +9,11 @@ import polars as pl
 
 from pipeline.config import load_config
 from pipeline.predict import load_ensemble_models, get_latest_features
+from pipeline.reliability import load_reliability_table, lookup_reliability
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("check_positions")
-
-
-def lookup_reliability(
-    table: dict, label: str, confidence: float
-) -> tuple[float | None, int]:
-    """
-    reliability_table.json から指定したラベルにおいて、
-    confidence以下の最大しきい値バケットの precision と support を取得する。
-    該当するしきい値が1つもない（テーブルの最小しきい値未満）の場合は (None, 0) を返す。
-    """
-    if label not in table:
-        return None, 0
-    
-    label_data = table[label]
-    applicable = []
-    for k, info in label_data.items():
-        try:
-            th = float(k)
-            # しきい値が確信度以下、かつ母数が1以上存在する場合に対象とする
-            if th <= confidence and info.get("support", 0) > 0:
-                applicable.append((th, info))
-        except ValueError:
-            continue
-            
-    if not applicable:
-        return None, 0
-        
-    # confidenceに最も近い（＝最大の）しきい値を採用
-    best_threshold, best_info = max(applicable, key=lambda x: x[0])
-    return best_info.get("precision"), best_info.get("support", 0)
 
 
 def analyze_positions(
@@ -73,13 +43,7 @@ def analyze_positions(
     feature_cols = metadata["feature_columns"]
     classes = metadata["label_classes"]
     
-    log.info("Loading reliability table from %s", reliability_path)
-    if reliability_path.exists():
-        with open(reliability_path, "r", encoding="utf-8") as f:
-            reliability_table = json.load(f)
-    else:
-        log.warning("Reliability table not found. Proceeding without calibration data.")
-        reliability_table = {}
+    reliability_table = load_reliability_table(reliability_path)
         
     config = load_config(config_path)
     
@@ -111,7 +75,6 @@ def analyze_positions(
             # 含み損益率の計算
             unrealized_return = (latest_close - entry_price) / entry_price
             
-            # 過去精度情報の取得
             precision, support = lookup_reliability(reliability_table, predicted_label, confidence)
             
             # 注意フラグ（flag）の判定
