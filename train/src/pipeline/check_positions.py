@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 import datetime
@@ -46,7 +47,17 @@ def analyze_positions(
     reliability_table = load_reliability_table(reliability_path)
         
     config = load_config(config_path)
-    
+
+    # 銘柄名マップの読み込み
+    names_dir = data_dir if data_dir is not None else Path(config.data.raw_dir)
+    names_map = {}
+    names_path = names_dir / "names.json"
+    if names_path.exists():
+        with open(names_path, encoding="utf-8") as f:
+            names_map = json.load(f)
+    else:
+        log.warning("names.json not found at %s. 名称列はコードで表示します。", names_path)
+
     results = []
     
     # 3. 銘柄ごとの予測と判定
@@ -107,6 +118,7 @@ def analyze_positions(
             
             results.append({
                 "code": ticker,
+                "name": names_map.get(ticker, ticker),
                 "entry_price": entry_price,
                 "latest_close": latest_close,
                 "unrealized_return": unrealized_return,
@@ -125,6 +137,7 @@ def analyze_positions(
             log.exception("Error processing ticker %s", ticker)
             results.append({
                 "code": ticker,
+                "name": names_map.get(ticker, ticker),
                 "entry_price": entry_price,
                 "latest_close": None,
                 "unrealized_return": None,
@@ -162,32 +175,32 @@ def analyze_positions(
     
     alerts = [r for r in results if r["flag"] != "正常"]
     if alerts:
-        report_md.append("| コード | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 | フラグ |")
-        report_md.append("|---|---|---|---|---|---|---|---|")
+        report_md.append("| コード | 名称 | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 | フラグ |")
+        report_md.append("|---|---|---|---|---|---|---|---|---|")
         for r in alerts:
             if r["status"] == "success":
                 ret_str = f"{r['unrealized_return']*100:+.2f}%"
                 conf_str = f"{r['confidence']*100:.1f}%"
                 prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "校正データなし"
                 supp_note = f" ({r['support_note']})" if r["support_note"] else ""
-                report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str}{supp_note} | {r['flag']} |")
+                report_md.append(f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str}{supp_note} | {r['flag']} |")
             else:
-                report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} (エラー: {r['error']}) |")
+                report_md.append(f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} (エラー: {r['error']}) |")
     else:
         report_md.append("現在、アラートが発生している銘柄はありません。")
         
     report_md.append("\n## 保有ポジション一覧")
-    report_md.append("| コード | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 (母数) | フラグ | 最新データ日 |")
-    report_md.append("|---|---|---|---|---|---|---|---|---|")
+    report_md.append("| コード | 名称 | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 (母数) | フラグ | 最新データ日 |")
+    report_md.append("|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
         if r["status"] == "success":
             ret_str = f"{r['unrealized_return']*100:+.2f}%"
             conf_str = f"{r['confidence']*100:.1f}%"
             prec_str = f"{r['precision']*100:.1f}%" if r["precision"] is not None else "校正データなし"
             supp_note = f" {r['support_note']}" if r["support_note"] else ""
-            report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str} ({r['support']}){supp_note} | {r['flag']} | {r['date']} |")
+            report_md.append(f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str} ({r['support']}){supp_note} | {r['flag']} | {r['date']} |")
         else:
-            report_md.append(f"| {r['code']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} | - |")
+            report_md.append(f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} | - |")
             
     with open(actual_report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_md))

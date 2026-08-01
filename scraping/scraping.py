@@ -1,7 +1,20 @@
 import os
 import csv
+import json
 from datetime import datetime
 import yfinance as yf
+
+
+def fetch_name(yf_ticker, code):
+    try:
+        info = yf.Ticker(yf_ticker).info
+        for key in ("shortName", "longName"):
+            name = info.get(key)
+            if name:
+                return str(name).strip()
+    except Exception:
+        pass
+    return code
 
 def main():
     # positions.csv のパス（../train/positions.csv）を設定
@@ -28,6 +41,13 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     error_log_path = os.path.join(output_dir, "error.log")
 
+    # 既存の銘柄名マップを読み込み（キャッシュ）
+    names_path = os.path.join(output_dir, "names.json")
+    names = {}
+    if os.path.exists(names_path):
+        with open(names_path, encoding="utf-8") as f:
+            names = json.load(f)
+
     success_count = 0
     failed_count = 0
 
@@ -35,6 +55,10 @@ def main():
         # 数字のみ、または末尾が 'A' で他が数字の場合は東証銘柄とみなして .T を付与
         is_jpx = ticker.isdigit() or (ticker[:-1].isdigit() and ticker.upper().endswith('A'))
         yf_ticker = f"{ticker}.T" if is_jpx else ticker
+
+        # 銘柄名の取得（キャッシュ済み以外のみ）
+        if ticker not in names:
+            names[ticker] = fetch_name(yf_ticker, ticker)
         
         # print(f"{yf_ticker} のデータをダウンロード中...")
         success = False
@@ -76,6 +100,11 @@ def main():
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_f.write(f"[{timestamp}] {yf_ticker}: {error_msg}\n")
             failed_count += 1
+
+    # 銘柄名マップを保存
+    with open(names_path, "w", encoding="utf-8") as f:
+        json.dump(names, f, ensure_ascii=False, indent=2)
+    print(f"銘柄名: {len(names)}件を {names_path} に保存しました。")
 
     print(f"成功：{success_count}件, 失敗：{failed_count}件")
 

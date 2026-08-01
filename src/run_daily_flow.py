@@ -39,6 +39,15 @@ def main():
         log.debug("Copied: %s -> %s", csv_file.name, dest_file)
     log.info("Successfully synced %d files.", len(csv_files))
 
+    # 銘柄名マップの同期
+    names_file = scrape_out_dir / "names.json"
+    if names_file.exists():
+        dest_names = train_raw_dir / names_file.name
+        shutil.copy2(names_file, dest_names)
+        log.info("Synced name map: %s -> %s", names_file.name, dest_names)
+    else:
+        log.warning("names.json not found in scraping output directory.")
+
     # 3. Task 2 ポジションチェックレポート生成の実行
     log.info("Step 3: Running positions alert checker...")
     check_cmd = [
