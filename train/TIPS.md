@@ -51,31 +51,79 @@ python -m src.pipeline.analyze_ticker \
     --out-json reports/1301_detail.json
 ```
 
+### モードC: positions.csv の全銘柄から個別詳細JSONを一括生成
+`positions.csv` に記載された全銘柄に対し、個別詳細分析データ（JSON）を一括でまとめて `reports/json/{銘柄コード}_detail.json` に出力します。
+
+```bash
+cd /app/train
+
+python -m src.pipeline.analyze_ticker \
+    --positions-csv positions.csv \
+    --model-dir models/task2 \
+    --reliability-table reliability_table.json
+```
+
 ---
 
-## 3. 注意点とより正確な分析のためのTips
+## 3. 良く使うコマンドまとめ
 
-### ① クロスセクション特徴量の補完（フォールバック）
-CSV単体から動的に特徴量を計算する場合、**他銘柄との比較が必要な特徴量**（例: 全銘柄中の出来高パーセンタイルを示す `volume_rank_pct` や、セクター平均に対するリターンを示す `sector_relative_return`）は算出できません。
+日常的な運用や実験で頻繁に使用する主要コマンドの一覧です。
 
-* **仕様**:
-  スクリプトはこれらを自動的に検知し、中央値や基準値となるデフォルト値（例: ランク系は `0.5`、相対リターン系は `0.0`）で補完して推論を実行します。そのため、CSV単体でもエラーにならずに動作します。
+### 1. 一括で銘柄データを更新する (`./scraping/collect_multi`)
+スクレイピングモジュールを使用して、全銘柄の最新株価データ（CSV）を一括取得・更新します。
+```bash
+cd /app/scraping
+python collect_multi.py
+```
+*(※全銘柄の最新データを同期・収集します)*
 
-### ② より厳密な推論を行いたい場合（キャッシュの活用）
-全銘柄を含めた最新のクロスセクション特徴量を正しく反映させた高精度な推論を行いたい場合は、以下の手順を踏んでください。
+### 2. モデルに学習させる (`./train`)
+収集したデータと特徴量パイプラインに基づき、Task2等の推論モデル（LightGBMアンサンブル等）の学習・評価を実行します。
+```bash
+cd /app/train
+python quick_eval.py train --data-dir data/raw --model-dir models/task2
+```
+*(※ `--sample-tickers 10` などのオプションを指定して高速テストも可能です)*
 
-1. **株価データの更新**:
-   `/app/scraping` にて `collect.py` 等を実行し、全銘柄の最新CSVを `data/raw` に同期します。
-2. **パイプラインによる特徴量キャッシュの再生成**:
-   以下のコマンドを実行し、特徴量の全体キャッシュである `features_cross.parquet`（または `features_single.parquet`）を更新します。
-   ```bash
-   python run_pipeline.py
-   ```
-3. **分析コマンドの実行（`--data-dir` を指定しない）**:
-   `--data-dir` を省略して実行すると、優先的に生成された Parquet キャッシュから最新行をロードするため、補完値（デフォルト値）ではない、真のセクター相対リターンやパーセンタイルランクを用いた厳密な予測が行われます。
-   ```bash
-   python -m src.pipeline.check_positions \
-       --positions positions.csv \
-       --model-dir models/task2 \
-       --reliability-table reliability_table.json
-   ```
+### 3. positions.csvにある内容で現在の状況を分析する (`run_daily_flow`)
+保有ポジション（`positions.csv`）に対して最新価格をあてはめ、予測結果と分析レポートを生成します。
+```bash
+cd /app/train
+python -m src.pipeline.check_positions \
+    --positions positions.csv \
+    --model-dir models/task2 \
+    --reliability-table reliability_table.json \
+    --report-out reports/daily_check.md
+```
+
+### 4. positions.csv から全銘柄の個別詳細JSONを一括生成する
+`positions.csv` 内の全銘柄の予測詳細データ（JSON）を `reports/json/` 以下に一括生成します。
+```bash
+cd /app/train
+python -m src.pipeline.analyze_ticker \
+    --positions-csv positions.csv \
+    --model-dir models/task2 \
+    --reliability-table reliability_table.json
+```
+
+### 5. experiment_shap.py batchで検証する
+SHAP値を用いた特徴量の重要度分析や複数銘柄の検証バッチ処理を実行します。
+```bash
+cd /app/train
+python experiment_shap.py batch
+```
+
+### 6. 校正テーブル (`reliability_table.json`) をホールドアウト評価で再生成する
+最新のデータセットと学習済みモデルを用い、銘柄軸ホールドアウト評価を実行して確信度・精度校正テーブル（`reliability_table.json`）を更新・出力します。
+```bash
+cd /app/train
+python evaluate_holdout.py \
+    --model-dir models/task2 \
+    --dataset-path data/datasets/task2_dataset.parquet \
+    --split-col split_type \
+    --split-value stock_holdout \
+    --label-col label \
+    --thresholds 0.5,0.6,0.7,0.8,0.9 \
+    --report-out reports/holdout_eval.md \
+    --table-out reliability_table.json
+```
