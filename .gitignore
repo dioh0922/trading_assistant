@@ -17,3 +17,4 @@ train/positions.csv
 train/reliability_table.json
 /batch
 /reports/llm_batch
+/reports

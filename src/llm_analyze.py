@@ -3,14 +3,14 @@ llm_analyze.py
 ────────────────
 analyze_ticker.py（モードB）が出力した銘柄詳細JSONに、
 - explanation_reliability（predicted_labelごとの説明信頼度メモ。銘柄固有実績があればそちらを優先）
-を付加した上で、Claude(LLM)に渡して解釈させるスクリプト。
+を付加した上で、Gemini(LLM)に渡して解釈させるスクリプト。
 
 llm_integration_policy.md（プロンプト設計）と
 shap_reliability_llm_integration_ideas.md（explanation_reliabilityの設計）を実装したもの。
 
 前提:
-- 環境変数 ANTHROPIC_API_KEY にAPIキーが設定されていること
-- pip install anthropic 済みであること
+- 環境変数 GEMINI_API_KEY にAPIキーが設定されていること
+- pip install google-genai 済みであること
 
 使い方:
     # 単一銘柄：実際にLLMへ問い合わせる
@@ -43,11 +43,14 @@ import re
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("llm_analyze")
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "gemini-3.5-flash"
 DEFAULT_JSON_DIR = Path("reports/json")
 
 # ファイル名パターン: {ticker}_detail_{YYYYMMDD}_{HHMMSS}.json
@@ -276,7 +279,8 @@ def build_user_content(detail: dict, reliability: dict) -> str:
 # ──────────────────────────────────────────────────────────────
 # 3. LLM呼び出し
 # ──────────────────────────────────────────────────────────────
-def call_llm(system_prompt: str, user_content: str, model: str) -> str:
+def call_llm_anthropic(system_prompt: str, user_content: str, model: str = "claude-sonnet-4-6") -> str:
+    """旧Anthropic (Claude) 実装。退避用。"""
     import anthropic
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -295,6 +299,41 @@ def call_llm(system_prompt: str, user_content: str, model: str) -> str:
     )
     text_parts = [block.text for block in response.content if block.type == "text"]
     return "\n".join(text_parts)
+
+
+def call_llm_gemini(system_prompt: str, user_content: str, model: str) -> str:
+    """Gemini API (google-genai SDK) を使用したLLM呼び出し"""
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "環境変数 GEMINI_API_KEY が設定されていません。"
+            "設定するか、--dry-run オプションでプロンプトの確認のみ行ってください。"
+        )
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=4000,
+    )
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=config,
+    )
+
+    if response.candidates:
+        finish_reason = response.candidates[0].finish_reason
+        if finish_reason and str(finish_reason) not in ("FinishReason.STOP", "STOP"):
+            log.warning("Geminiの応答が完了理由 '%s' により途切れた可能性があります。", finish_reason)
+
+    return response.text or ""
+
+
+def call_llm(system_prompt: str, user_content: str, model: str) -> str:
+    return call_llm_gemini(system_prompt, user_content, model)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -329,7 +368,7 @@ def analyze_one_ticker(
 
         result_text = None
         if not dry_run:
-            log.info("[%s] Claude(%s)に問い合わせています...", ticker, model)
+            log.info("[%s] Gemini(%s)に問い合わせています...", ticker, model)
             result_text = call_llm(SYSTEM_PROMPT, user_content, model)
 
         return {
