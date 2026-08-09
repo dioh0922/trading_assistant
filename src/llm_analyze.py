@@ -13,14 +13,24 @@ shap_reliability_llm_integration_ideas.md（explanation_reliabilityの設計）�
 - pip install anthropic 済みであること
 
 使い方:
-    # 実際にLLMへ問い合わせる
-    python llm_analyze.py \
-        --input-json 6098_detail_20260802_105439.json \
+    # 単一銘柄：実際にLLMへ問い合わせる
+    python llm_analyze.py single --ticker 6098 \
         --combined-records reports/combined_records.csv \
         --output reports/6098_llm_analysis.md
 
-    # LLMを呼ばず、組み立てたプロンプトだけを確認する（APIキー不要）
-    python llm_analyze.py --input-json 6098_detail_20260802_105439.json --dry-run
+    # 単一銘柄：LLMを呼ばず、組み立てたプロンプトだけを確認する（APIキー不要）
+    python llm_analyze.py single --ticker 6098 --dry-run
+
+    # 一括：check_positions.py（モードA）が出力した日次レポートから
+    # 「要注意銘柄（アラート発生）」のコードを自動抽出し、まとめてLLM分析にかける
+    python llm_analyze.py batch \
+        --daily-check-report daily_check_20260809_113205.md \
+        --json-dir reports/json \
+        --combined-records reports/combined_records.csv \
+        --output-dir reports/llm_batch
+
+    # 一括：銘柄コードを直接指定する場合（レポートのパース不要）
+    python llm_analyze.py batch --tickers 3405,4452,6857 --output-dir reports/llm_batch
 """
 
 from __future__ import annotations
@@ -73,6 +83,53 @@ def find_latest_detail_json(json_dir: Path, ticker: str) -> Path:
     log.info("最新のJSONを選択: %s（タイムスタンプ: %s, 候補%d件中）",
               latest_path.name, latest_timestamp, len(parsed))
     return latest_path
+
+
+def extract_flagged_tickers(report_path: Path) -> list[str]:
+    """
+    check_positions.py（モードA）が出力した日次レポート（daily_check_*.md）から、
+    「## 要注意銘柄」セクションのMarkdown表を読み取り、コード列（先頭列）を抽出する。
+    """
+    text = report_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    section_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("## 要注意銘柄"):
+            section_start = i
+            break
+    if section_start is None:
+        raise ValueError(
+            f"{report_path} に '## 要注意銘柄' セクションが見つかりません。"
+            f" レポートの形式を確認するか、--tickers で直接指定してください。"
+        )
+
+    section_end = len(lines)
+    for i in range(section_start + 1, len(lines)):
+        if lines[i].strip().startswith("## "):
+            section_end = i
+            break
+
+    tickers = []
+    for line in lines[section_start:section_end]:
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells:
+            continue
+        first_cell = cells[0]
+        # ヘッダー行（「コード」）と区切り行（「---」等）を除外する
+        if first_cell in ("コード",) or set(first_cell) <= {"-", ":"}:
+            continue
+        if first_cell:
+            tickers.append(first_cell)
+
+    if not tickers:
+        log.warning("'## 要注意銘柄' セクションは見つかりましたが、銘柄コードを1件も抽出できませんでした。")
+    else:
+        log.info("要注意銘柄を%d件抽出しました: %s", len(tickers), tickers)
+    return tickers
 
 # aggregate_batch_stats.py による検証結果（2026-08-08時点、57件・14銘柄）のフォールバック値。
 # combined_records.csv が渡された場合は、そちらから動的に再計算する（値はこの定数を上書きする）。
@@ -243,7 +300,59 @@ def call_llm(system_prompt: str, user_content: str, model: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # メイン処理
 # ──────────────────────────────────────────────────────────────
-def run(
+def analyze_one_ticker(
+    ticker: str,
+    json_dir: Path,
+    combined_records: pd.DataFrame | None,
+    model: str,
+    dry_run: bool,
+) -> dict:
+    """
+    1銘柄分の「最新JSON取得 → explanation_reliability算出 → プロンプト構築 → (必要なら)LLM呼び出し」
+    をまとめて行う共通処理。単発コマンド（single）・一括コマンド（batch）の両方から使う。
+
+    戻り値: {ticker, input_json, reliability, user_content, result_text(dry_runならNone), error(あれば)}
+    """
+    try:
+        input_json = find_latest_detail_json(json_dir, ticker)
+        with open(input_json, "r", encoding="utf-8") as f:
+            detail = json.load(f)
+
+        actual_ticker = detail.get("ticker", ticker)
+        predicted_label = detail["prediction"]["predicted_label"]
+
+        reliability = compute_explanation_reliability(actual_ticker, predicted_label, combined_records)
+        log.info("[%s] explanation_reliability: source=%s, mean_spearman_corr=%s, n=%s",
+                  ticker, reliability["source"], reliability["mean_spearman_corr"], reliability["n"])
+
+        user_content = build_user_content(detail, reliability)
+
+        result_text = None
+        if not dry_run:
+            log.info("[%s] Claude(%s)に問い合わせています...", ticker, model)
+            result_text = call_llm(SYSTEM_PROMPT, user_content, model)
+
+        return {
+            "ticker": ticker,
+            "input_json": input_json,
+            "reliability": reliability,
+            "user_content": user_content,
+            "result_text": result_text,
+            "error": None,
+        }
+    except Exception as e:
+        log.warning("[%s] 処理に失敗しました: %s", ticker, e)
+        return {
+            "ticker": ticker,
+            "input_json": None,
+            "reliability": None,
+            "user_content": None,
+            "result_text": None,
+            "error": str(e),
+        }
+
+
+def run_single(
     ticker: str,
     json_dir: Path,
     combined_records_path: Path | None,
@@ -251,27 +360,11 @@ def run(
     output: Path | None,
     dry_run: bool,
 ) -> None:
-    input_json = find_latest_detail_json(json_dir, ticker)
+    combined_records = load_combined_records(combined_records_path)
+    result = analyze_one_ticker(ticker, json_dir, combined_records, model, dry_run)
 
-    with open(input_json, "r", encoding="utf-8") as f:
-        detail = json.load(f)
-
-    combined_records = None
-    if combined_records_path is not None:
-        if not combined_records_path.exists():
-            log.warning("%s が見つからないため、母集団のフォールバック値を使用します。", combined_records_path)
-        else:
-            combined_records = pd.read_csv(combined_records_path)
-            log.info("combined_recordsを読み込みました: %d件", len(combined_records))
-
-    ticker = detail.get("ticker", "?")
-    predicted_label = detail["prediction"]["predicted_label"]
-
-    reliability = compute_explanation_reliability(ticker, predicted_label, combined_records)
-    log.info("explanation_reliability: source=%s, mean_spearman_corr=%s, n=%s",
-              reliability["source"], reliability["mean_spearman_corr"], reliability["n"])
-
-    user_content = build_user_content(detail, reliability)
+    if result["error"] is not None:
+        raise RuntimeError(result["error"])
 
     if dry_run:
         print("=" * 60)
@@ -281,54 +374,179 @@ def run(
         print("=" * 60)
         print("【user content（LLMに渡すJSON）】")
         print("=" * 60)
-        print(user_content)
+        print(result["user_content"])
         print("\n--dry-run のため、実際のLLM呼び出しは行っていません。")
         return
-
-    log.info("Claude(%s)に問い合わせています...", model)
-    result_text = call_llm(SYSTEM_PROMPT, user_content, model)
 
     print("=" * 60)
     print(f"【{ticker} の分析結果】")
     print("=" * 60)
-    print(result_text)
+    print(result["result_text"])
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
             f"# {ticker} 分析結果\n\n"
-            f"- 入力: {input_json}\n"
+            f"- 入力: {result['input_json']}\n"
             f"- モデル: {model}\n"
-            f"- explanation_reliability: {reliability}\n\n"
-            f"---\n\n{result_text}\n",
+            f"- explanation_reliability: {result['reliability']}\n\n"
+            f"---\n\n{result['result_text']}\n",
             encoding="utf-8",
         )
         log.info("output written to %s", output)
 
 
+def run_batch(
+    tickers: list[str],
+    json_dir: Path,
+    combined_records_path: Path | None,
+    model: str,
+    output_dir: Path,
+    dry_run: bool,
+) -> None:
+    combined_records = load_combined_records(combined_records_path)
+
+    results = []
+    for ticker in tickers:
+        result = analyze_one_ticker(ticker, json_dir, combined_records, model, dry_run)
+        results.append(result)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_lines = []
+    summary_lines.append("# LLM一括分析 サマリー")
+    summary_lines.append("")
+    summary_lines.append(f"- 対象銘柄数: {len(tickers)}")
+    summary_lines.append(f"- 成功: {sum(1 for r in results if r['error'] is None)}"
+                          f" / 失敗: {sum(1 for r in results if r['error'] is not None)}")
+    summary_lines.append("")
+
+    for result in results:
+        ticker = result["ticker"]
+        if result["error"] is not None:
+            summary_lines.append(f"## {ticker}: 処理失敗")
+            summary_lines.append("")
+            summary_lines.append(f"- エラー: {result['error']}")
+            summary_lines.append("")
+            continue
+
+        if dry_run:
+            individual_path = output_dir / f"{ticker}_prompt.md"
+            individual_path.write_text(
+                f"# {ticker} プロンプト（dry-run）\n\n"
+                f"- 入力: {result['input_json']}\n"
+                f"- explanation_reliability: {result['reliability']}\n\n"
+                f"## system prompt\n\n```\n{SYSTEM_PROMPT}\n```\n\n"
+                f"## user content\n\n```json\n{result['user_content']}\n```\n",
+                encoding="utf-8",
+            )
+            summary_lines.append(f"## {ticker}: dry-run（プロンプトのみ生成）")
+            summary_lines.append("")
+            summary_lines.append(f"- 詳細: {individual_path.name}")
+            summary_lines.append(f"- explanation_reliability: {result['reliability']['note']}")
+            summary_lines.append("")
+        else:
+            individual_path = output_dir / f"{ticker}_llm_analysis.md"
+            individual_path.write_text(
+                f"# {ticker} 分析結果\n\n"
+                f"- 入力: {result['input_json']}\n"
+                f"- モデル: {model}\n"
+                f"- explanation_reliability: {result['reliability']}\n\n"
+                f"---\n\n{result['result_text']}\n",
+                encoding="utf-8",
+            )
+            log.info("[%s] output written to %s", ticker, individual_path)
+
+            summary_lines.append(f"## {ticker}")
+            summary_lines.append("")
+            summary_lines.append(f"- 詳細: {individual_path.name}")
+            summary_lines.append("")
+            summary_lines.append(result["result_text"])
+            summary_lines.append("")
+
+    summary_path = output_dir / "summary.md"
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+    log.info("=" * 60)
+    log.info("一括分析完了。出力先: %s", output_dir)
+    log.info("=" * 60)
+    print("\n".join(summary_lines))
+
+
+def load_combined_records(combined_records_path: Path | None) -> pd.DataFrame | None:
+    if combined_records_path is None:
+        return None
+    if not combined_records_path.exists():
+        log.warning("%s が見つからないため、母集団のフォールバック値を使用します。", combined_records_path)
+        return None
+    combined_records = pd.read_csv(combined_records_path)
+    log.info("combined_recordsを読み込みました: %d件", len(combined_records))
+    return combined_records
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="銘柄詳細JSONをLLMに渡して解釈させる")
-    parser.add_argument("--ticker", type=str, required=True,
-                         help="銘柄コード（例: 6098）。指定した銘柄の最新タイムスタンプのJSONを自動選択する")
-    parser.add_argument("--json-dir", type=Path, default=DEFAULT_JSON_DIR,
-                         help=f"analyze_ticker.py の出力JSON群があるディレクトリ（デフォルト: {DEFAULT_JSON_DIR}）")
-    parser.add_argument("--combined-records", type=Path, default=None,
-                         help="aggregate_batch_stats.py が出力した combined_records.csv"
-                              "（省略時は固定のフォールバック値を使用）")
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--output", type=Path, default=None, help="分析結果を保存するmdファイルパス")
-    parser.add_argument("--dry-run", action="store_true",
-                         help="LLMを呼ばず、組み立てたプロンプトを表示するだけ（APIキー不要）")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    single_parser = subparsers.add_parser("single", help="1銘柄をLLMに分析させる")
+    single_parser.add_argument("--ticker", type=str, required=True,
+                                help="銘柄コード（例: 6098）。指定した銘柄の最新タイムスタンプのJSONを自動選択する")
+    single_parser.add_argument("--json-dir", type=Path, default=DEFAULT_JSON_DIR,
+                                help=f"analyze_ticker.py の出力JSON群があるディレクトリ（デフォルト: {DEFAULT_JSON_DIR}）")
+    single_parser.add_argument("--combined-records", type=Path, default=None,
+                                help="aggregate_batch_stats.py が出力した combined_records.csv"
+                                     "（省略時は固定のフォールバック値を使用）")
+    single_parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    single_parser.add_argument("--output", type=Path, default=None, help="分析結果を保存するmdファイルパス")
+    single_parser.add_argument("--dry-run", action="store_true",
+                                help="LLMを呼ばず、組み立てたプロンプトを表示するだけ（APIキー不要）")
+
+    batch_parser = subparsers.add_parser("batch", help="複数銘柄をまとめてLLMに分析させる")
+    batch_parser.add_argument("--daily-check-report", type=Path, default=None,
+                               help="check_positions.py が出力した日次レポート。"
+                                    "'## 要注意銘柄' セクションから銘柄コードを自動抽出する")
+    batch_parser.add_argument("--tickers", type=str, default=None,
+                               help="カンマ区切りの銘柄コードを直接指定する場合"
+                                    "（--daily-check-report と併用不可、どちらか一方を指定）")
+    batch_parser.add_argument("--json-dir", type=Path, default=DEFAULT_JSON_DIR)
+    batch_parser.add_argument("--combined-records", type=Path, default=None)
+    batch_parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    batch_parser.add_argument("--output-dir", type=Path, default=Path("reports/llm_batch"),
+                               help="銘柄ごとの分析結果とsummary.mdの出力先ディレクトリ")
+    batch_parser.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
 
-    run(
-        ticker=args.ticker,
-        json_dir=args.json_dir,
-        combined_records_path=args.combined_records,
-        model=args.model,
-        output=args.output,
-        dry_run=args.dry_run,
-    )
+    if args.command == "single":
+        run_single(
+            ticker=args.ticker,
+            json_dir=args.json_dir,
+            combined_records_path=args.combined_records,
+            model=args.model,
+            output=args.output,
+            dry_run=args.dry_run,
+        )
+    elif args.command == "batch":
+        if args.daily_check_report is None and args.tickers is None:
+            raise SystemExit("--daily-check-report か --tickers のどちらかを指定してください。")
+        if args.daily_check_report is not None and args.tickers is not None:
+            raise SystemExit("--daily-check-report と --tickers は同時に指定できません。")
+
+        if args.tickers is not None:
+            tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+        else:
+            tickers = extract_flagged_tickers(args.daily_check_report)
+
+        if not tickers:
+            raise SystemExit("対象銘柄が0件のため、処理を終了します。")
+
+        run_batch(
+            tickers=tickers,
+            json_dir=args.json_dir,
+            combined_records_path=args.combined_records,
+            model=args.model,
+            output_dir=args.output_dir,
+            dry_run=args.dry_run,
+        )
 
 
 if __name__ == "__main__":
