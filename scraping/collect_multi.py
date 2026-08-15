@@ -1,7 +1,9 @@
 import os
 import time
+import argparse
 import threading
 from datetime import datetime
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
@@ -13,6 +15,7 @@ success_count = 0
 failed_count = 0
 skipped_count = 0
 completed_count = 0
+output_dir_path = None
 
 
 def download_with_retry(yf_ticker):
@@ -33,7 +36,7 @@ def process_code(code):
     global success_count, failed_count, skipped_count, completed_count
 
     yf_ticker = f"{code}.T"
-    output_csv = os.path.join("./csv/collect", f"{code}.csv")
+    output_csv = os.path.join(output_dir_path, f"{code}.csv")
 
     if os.path.exists(output_csv):
         with lock:
@@ -58,7 +61,7 @@ def process_code(code):
         if not error_msg:
             error_msg = "データが取得できませんでした (10y/5y)。"
         with lock:
-            error_log_path = os.path.join("./csv/collect", "error.log")
+            error_log_path = os.path.join(output_dir_path, "error.log")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(error_log_path, "a", encoding="utf-8") as log_f:
                 log_f.write(f"[{timestamp}] {yf_ticker}: {error_msg}\n")
@@ -71,10 +74,17 @@ def process_code(code):
 
 
 def main():
-    global total
+    global total, output_dir_path
 
-    output_dir = "./csv/collect"
-    os.makedirs(output_dir, exist_ok=True)
+    project_root = Path(__file__).resolve().parent.parent
+    default_output_dir = project_root / "data" / "raw"
+
+    parser = argparse.ArgumentParser(description="Multi-ticker batch scraper")
+    parser.add_argument("--output-dir", type=Path, default=default_output_dir, help="Directory to save output CSVs")
+    args = parser.parse_args()
+
+    output_dir_path = str(args.output_dir)
+    os.makedirs(output_dir_path, exist_ok=True)
 
     codes_path = os.path.join(os.path.dirname(__file__), "exist.txt")
     with open(codes_path, encoding="utf-8") as f:
@@ -92,3 +102,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

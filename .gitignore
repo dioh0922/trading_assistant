@@ -18,3 +18,4 @@ train/reliability_table.json
 /batch
 /reports/llm_batch
 /reports
+/data/raw

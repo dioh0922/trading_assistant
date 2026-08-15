@@ -1,7 +1,9 @@
 import os
 import csv
 import json
+import argparse
 from datetime import datetime
+from pathlib import Path
 import yfinance as yf
 
 
@@ -17,10 +19,30 @@ def fetch_name(yf_ticker, code):
     return code
 
 def main():
-    # positions.csv のパス（../train/positions.csv）を設定
-    positions_file = os.path.join(os.path.dirname(__file__), "..", "train", "positions.csv")
-    if not os.path.exists(positions_file):
-        print(f"エラー: {positions_file} が見つかりません。")
+    project_root = Path(__file__).resolve().parent.parent
+    default_output_dir = project_root / "data" / "raw"
+
+    parser = argparse.ArgumentParser(description="Scrape stock price data for positions.")
+    parser.add_argument("--output-dir", type=Path, default=default_output_dir, help="Directory to save output CSVs and names.json")
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # positions.csv のパスを探す (ルート直下, train/, または positions.csv)
+    candidates = [
+        project_root / "positions.csv",
+        project_root / "train" / "positions.csv",
+        Path("positions.csv")
+    ]
+    positions_file = None
+    for cand in candidates:
+        if cand.exists():
+            positions_file = cand
+            break
+
+    if not positions_file:
+        print("エラー: positions.csv が見つかりません。")
         return
 
     tickers = []
@@ -36,9 +58,6 @@ def main():
         print("対象の銘柄コードが positions.csv に記載されていません。")
         return
 
-    # CSV出力用ディレクトリの作成
-    output_dir = "./csv"
-    os.makedirs(output_dir, exist_ok=True)
     error_log_path = os.path.join(output_dir, "error.log")
 
     # 既存の銘柄名マップを読み込み（キャッシュ）
@@ -60,14 +79,13 @@ def main():
         if ticker not in names:
             names[ticker] = fetch_name(yf_ticker, ticker)
         
-        # print(f"{yf_ticker} のデータをダウンロード中...")
         success = False
         stock_data = None
         error_msg = ""
 
         # まずは 10年分 (10y) でダウンロードを試みる
         try:
-            stock_data = yf.download(tickers=yf_ticker, period="10y", interval="1d")
+            stock_data = yf.download(tickers=yf_ticker, period="10y", interval="1d", progress=False)
             if not stock_data.empty:
                 success = True
             else:
@@ -78,8 +96,7 @@ def main():
         # 10y で失敗した場合は 5年分 (5y) で再試行
         if not success:
             try:
-                # print(f"{yf_ticker} のデータを period=5y で再試行中...")
-                stock_data = yf.download(tickers=yf_ticker, period="5y", interval="1d")
+                stock_data = yf.download(tickers=yf_ticker, period="5y", interval="1d", progress=False)
                 if not stock_data.empty:
                     success = True
                 else:
@@ -91,7 +108,6 @@ def main():
             # CSVファイルに書き出し
             output_csv = os.path.join(output_dir, f"{ticker}.csv")
             stock_data.to_csv(output_csv)
-            #print(f"成功: {output_csv} にデータを保存しました。")
             success_count += 1
         else:
             print(f"警告/エラー: {yf_ticker} のダウンロードに失敗しました。詳細: {error_msg}")
@@ -110,3 +126,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

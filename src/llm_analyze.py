@@ -59,23 +59,31 @@ DETAIL_FILENAME_RE = re.compile(r"^(?P<ticker>.+)_detail_(?P<timestamp>\d{8}_\d{
 
 def find_latest_detail_json(json_dir: Path, ticker: str) -> Path:
     """
-    json_dir配下から f"{ticker}_detail_*.json" にマッチするファイルを探し、
-    ファイル名に埋め込まれたタイムスタンプ（YYYYMMDD_HHMMSS）が最も新しいものを返す。
-    タイムスタンプの解析に失敗したファイルは、安全側に倒して除外する。
+    json_dir配下から f"{ticker}_detail_*.json" または f"{ticker}_detail.json" を探す。
+    タイムスタンプ付きがある場合は最新のものを、タイムスタンプなしがある場合はそれを採用。
     """
     candidates = sorted(json_dir.glob(f"{ticker}_detail_*.json"))
+    plain_detail = json_dir / f"{ticker}_detail.json"
+    if plain_detail.exists():
+        candidates.append(plain_detail)
+
     if not candidates:
         raise FileNotFoundError(
-            f"{json_dir} に '{ticker}_detail_*.json' に一致するファイルが見つかりません。"
+            f"{json_dir} に '{ticker}_detail_*.json' または '{ticker}_detail.json' が見つかりません。"
         )
 
     parsed = []
     for path in candidates:
+        if path.name == f"{ticker}_detail.json":
+            parsed.append(("00000000_000000", path))
+            continue
         m = DETAIL_FILENAME_RE.match(path.name)
         if m and m.group("ticker") == ticker:
             parsed.append((m.group("timestamp"), path))
 
     if not parsed:
+        if plain_detail.exists():
+            return plain_detail
         raise FileNotFoundError(
             f"{json_dir} に '{ticker}_detail_*.json' 形式（例: {ticker}_detail_20260728_094338.json）"
             f"に一致するファイルが見つかりません。見つかった候補: {[p.name for p in candidates]}"
@@ -88,12 +96,30 @@ def find_latest_detail_json(json_dir: Path, ticker: str) -> Path:
     return latest_path
 
 
+
 def extract_flagged_tickers(report_path: Path) -> list[str]:
     """
     check_positions.py（モードA）が出力した日次レポート（daily_check_*.md）から、
     「## 要注意銘柄」セクションのMarkdown表を読み取り、コード列（先頭列）を抽出する。
     """
-    text = report_path.read_text(encoding="utf-8")
+    # 指定パスが存在しない場合、同ディレクトリおよび reports/, train/reports/ から最新を検索
+    actual_path = report_path
+    if not actual_path.exists():
+        candidates = []
+        for search_dir in [report_path.parent, Path("reports"), Path("train/reports")]:
+            if search_dir.exists():
+                candidates.extend(search_dir.glob("daily_check*.md"))
+        candidates = list(set(candidates))
+        if not candidates:
+            raise FileNotFoundError(
+                f"日次レポートが見つかりません: {report_path} "
+                f"(reports/ および train/reports/ も検索済み)"
+            )
+        candidates.sort(key=lambda p: p.name)
+        actual_path = candidates[-1]
+        log.info("指定レポートが存在しないため最新を自動選択: %s", actual_path)
+
+    text = actual_path.read_text(encoding="utf-8")
     lines = text.splitlines()
 
     section_start = None

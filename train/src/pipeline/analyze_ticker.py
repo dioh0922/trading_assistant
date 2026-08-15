@@ -174,11 +174,15 @@ def main() -> None:
         reliability_table = load_reliability_table(args.reliability_table)
         config = load_config(args.config)
 
+        # --out-json の親ディレクトリをバッチ出力先として使用
+        out_dir = args.out_json.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         df = pl.read_csv(args.positions_csv)
         for row in df.iter_rows(named=True):
             ticker = str(row["code"])
             entry_price = float(row["entry_price"])
-            out_path = Path(f"reports/json/{ticker}_detail.json")
+            out_path = out_dir / f"{ticker}_detail.json"
             _analyze_single_ticker(
                 ticker=ticker,
                 entry_price=entry_price,

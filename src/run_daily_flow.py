@@ -1,5 +1,4 @@
 import subprocess
-import shutil
 import logging
 from pathlib import Path
 
@@ -13,55 +12,35 @@ def run_command(cmd: list[str], cwd: Path) -> bool:
 
 def main():
     project_root = Path(__file__).resolve().parent.parent
-    train_dir = project_root / "train"
-    scraping_dir = project_root / "scraping"
+    data_raw_dir = project_root / "data" / "raw"
+    reports_daily_dir = project_root / "reports" / "daily"
+    data_raw_dir.mkdir(parents=True, exist_ok=True)
+    reports_daily_dir.mkdir(parents=True, exist_ok=True)
 
-    scrape_out_dir = scraping_dir / "csv"
-    train_raw_dir = train_dir / "data" / "raw"
-
-    # 1. スクレイピングの実行
+    # 1. スクレイピングの実行 (直接 data/raw に出力)
     log.info("Step 1: Running scraping script...")
-    if not run_command(["python", "scraping.py"], cwd=scraping_dir):
+    scrape_cmd = ["python", str(project_root / "scraping" / "scraping.py"), "--output-dir", str(data_raw_dir)]
+    if not run_command(scrape_cmd, cwd=project_root):
         log.error("Scraping failed.")
         return
 
-    # 2. ディレクトリのズレを吸収 (ファイルのコピー)
-    log.info("Step 2: Syncing downloaded CSV files to train raw data directory...")
-    train_raw_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_files = list(scrape_out_dir.glob("*.csv"))
-    if not csv_files:
-        log.warning("No CSV files found in scraping output directory.")
-
-    for csv_file in csv_files:
-        dest_file = train_raw_dir / csv_file.name
-        shutil.copy2(csv_file, dest_file)
-        log.debug("Copied: %s -> %s", csv_file.name, dest_file)
-    log.info("Successfully synced %d files.", len(csv_files))
-
-    # 銘柄名マップの同期
-    names_file = scrape_out_dir / "names.json"
-    if names_file.exists():
-        dest_names = train_raw_dir / names_file.name
-        shutil.copy2(names_file, dest_names)
-        log.info("Synced name map: %s -> %s", names_file.name, dest_names)
-    else:
-        log.warning("names.json not found in scraping output directory.")
-
-    # 3. Task 2 ポジションチェックレポート生成の実行
-    log.info("Step 3: Running positions alert checker...")
+    # 2. Task 2 ポジションチェックレポート生成の実行
+    log.info("Step 2: Running positions alert checker...")
+    check_report_path = project_root / "reports" / "daily_check.md"
     check_cmd = [
         "python", "-m", "src.pipeline.check_positions",
-        "--positions", "positions.csv",
+        "--positions", str(project_root / "train" / "positions.csv"),
         "--model-dir", "models/task2",
         "--reliability-table", "reliability_table.json",
-        "--report-out", "reports/daily_check.md"
+        "--report-out", str(check_report_path)
     ]
+    train_dir = project_root / "train"
     if not run_command(check_cmd, cwd=train_dir):
         log.error("Positions checker failed.")
         return
 
-    log.info("Daily workflow completed successfully.")
+    log.info("Daily workflow completed successfully. Output: %s", check_report_path)
 
 if __name__ == "__main__":
     main()
+
