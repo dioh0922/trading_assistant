@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.0
+    hooks:
+      # 自動フォーマット（タブの修正・スペース2個化を含む）
+      - id: ruff-format
+      # 修正結果をコミット対象に自動で含める場合
+      - id: ruff
+        args: [--fix]
