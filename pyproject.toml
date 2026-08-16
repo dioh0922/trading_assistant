@@ -1,0 +1,7 @@
+[tool.ruff]
+# インデント幅（スペースの数）は [tool.ruff] 直下に記述します
+indent-width = 2
+
+[tool.ruff.format]
+indent-style = "space"
+line-ending = "lf"
