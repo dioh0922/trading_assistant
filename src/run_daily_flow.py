@@ -42,6 +42,8 @@ def main():
     "src.pipeline.check_positions",
     "--positions",
     str(project_root / "train" / "positions.csv"),
+    "--data-dir",
+    str(data_raw_dir),
     "--model-dir",
     "models/task2",
     "--reliability-table",

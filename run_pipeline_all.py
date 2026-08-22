@@ -58,15 +58,17 @@ def run_step_daily() -> bool:
 def run_step_json(ticker: str | None = None) -> bool:
   log.info("=== [Step 4/5] 個別詳細JSON生成 ===")
   json_dir = PROJECT_ROOT / "reports" / "json"
-  json_dir.mkdir(parents=True, exist_ok=True)
   out_json_target = json_dir / (
     f"{ticker}_detail.json" if ticker else "ticker_detail.json"
   )
+  data_raw_dir = PROJECT_ROOT / "data" / "raw"
 
   cmd = [
     sys.executable,
     "-m",
     "src.pipeline.analyze_ticker",
+    "--data-dir",
+    str(data_raw_dir),
     "--model-dir",
     "models/task2",
     "--reliability-table",
