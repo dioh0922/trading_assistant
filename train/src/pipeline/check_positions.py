@@ -11,6 +11,7 @@ import polars as pl
 from pipeline.config import load_config
 from pipeline.predict import load_ensemble_models, get_latest_features
 from pipeline.reliability import load_reliability_table, lookup_reliability
+from pipeline.rules import evaluate_position_rules
 
 # ログ設定
 logging.basicConfig(
@@ -40,6 +41,8 @@ def analyze_positions(
     if col not in positions_df.columns:
       raise ValueError(f"Required column '{col}' is missing in positions file.")
 
+  has_entry_date = "entry_date" in positions_df.columns
+
   # 2. モデルとメタデータ、校正テーブルのロード
   log.info("Loading models from %s", model_dir)
   models, metadata = load_ensemble_models(model_dir)
@@ -66,12 +69,25 @@ def analyze_positions(
   for row in positions_df.iter_rows(named=True):
     ticker = str(row["code"])
     entry_price = float(row["entry_price"])
+    entry_date = (
+      str(row["entry_date"])
+      if has_entry_date and row["entry_date"] is not None
+      else None
+    )
 
     try:
       # 最新特徴量の取得
       latest_df = get_latest_features(config, ticker, data_dir, feature_cols)
       latest_date = latest_df["date"][0]
       latest_close = float(latest_df["close"][0])
+
+      # 取引ルール（RULE.md）に基づく判定
+      pos_status = evaluate_position_rules(
+        code=ticker,
+        entry_price=entry_price,
+        current_price=latest_close,
+        entry_date=entry_date,
+      )
 
       # 推論用の特徴量選択
       X = latest_df.select(feature_cols).to_pandas()
@@ -85,8 +101,7 @@ def analyze_positions(
       predicted_label = classes[max_idx]
       confidence = float(avg_proba[max_idx])
 
-      # 含み損益率の計算
-      unrealized_return = (latest_close - entry_price) / entry_price
+      unrealized_return = pos_status.unrealized_return
 
       precision, support = lookup_reliability(
         reliability_table, predicted_label, confidence
@@ -95,36 +110,53 @@ def analyze_positions(
       # 注意フラグ（flag）の判定
       flags = []
 
-      # 1. 予測に基づくアラート (閾値 0.65)
-      if predicted_label == "lower" and confidence >= 0.65:
-        flags.append("🚨損切り警戒")
-      elif predicted_label == "upper" and confidence >= 0.65:
-        flags.append("✨利確検討")
+      # 1. ルールに基づくアラート（最優先）
+      if pos_status.target_hit.stop_loss_hit:
+        flags.append("🚨 損切りライン到達(-5%): 即時損切り対象")
+      elif pos_status.target_hit.take_profit_hit:
+        flags.append("🎯 利確ライン到達(+10%): 下降兆候監視")
+      elif pos_status.time_rule_triggered:
+        if unrealized_return >= 0:
+          flags.append("⏱️ 10日ルール発動: 全清算検討")
+        else:
+          flags.append("⏱️ 10日ルール発動: 半数損切り検討")
 
-      # 2. 実損益に基づくアラート
-      if unrealized_return >= 0.08:
-        flags.append("📈利確目安到達")
-      elif unrealized_return <= -0.04:
-        flags.append("📉損切り目安到達")
+      # 2. 予測に基づくアラート (閾値 0.65)
+      if (
+        predicted_label == "lower"
+        and confidence >= 0.65
+        and not pos_status.target_hit.stop_loss_hit
+      ):
+        flags.append("🚨 損切り警戒(予測下落)")
+      elif (
+        predicted_label == "upper"
+        and confidence >= 0.65
+        and not pos_status.target_hit.take_profit_hit
+      ):
+        flags.append("✨ 利確検討(予測上昇)")
 
       # 3. 予測と実損益の相反（矛盾）チェック
       if unrealized_return >= 0.08 and predicted_label == "lower":
-        flags.append("⚠️含み益到達も予測は下落方向（反落リスクに留意）")
+        flags.append("⚠️ 含み益到達も予測は下落方向（反落リスクに留意）")
       elif unrealized_return <= -0.04 and predicted_label == "upper":
-        flags.append("⚠️含み損到達も予測は上昇方向（回復の可能性）")
+        flags.append("⚠️ 含み損到達も予測は上昇方向（回復の可能性）")
 
       # 母数警告
       support_note = ""
       if support is not None and support < 20:
         support_note = "※母数少"
 
-      flag_str = ", ".join(flags) if flags else "正常"
+      flag_str = "<br>".join(flags) if flags else "正常"
 
       results.append(
         {
           "code": ticker,
           "name": names_map.get(ticker, ticker),
           "entry_price": entry_price,
+          "entry_date": pos_status.entry_date or "-",
+          "holding_days": pos_status.holding_days
+          if pos_status.holding_days is not None
+          else "-",
           "latest_close": latest_close,
           "unrealized_return": unrealized_return,
           "predicted_label": predicted_label,
@@ -132,6 +164,7 @@ def analyze_positions(
           "precision": precision,
           "support": support,
           "support_note": support_note,
+          "pos_status": pos_status,
           "flag": flag_str,
           "date": latest_date,
           "status": "success",
@@ -146,6 +179,8 @@ def analyze_positions(
           "code": ticker,
           "name": names_map.get(ticker, ticker),
           "entry_price": entry_price,
+          "entry_date": entry_date or "-",
+          "holding_days": "-",
           "latest_close": None,
           "unrealized_return": None,
           "predicted_label": "",
@@ -153,6 +188,7 @@ def analyze_positions(
           "precision": None,
           "support": 0,
           "support_note": "",
+          "pos_status": None,
           "flag": "❌エラー",
           "date": "-",
           "status": "error",
@@ -190,9 +226,9 @@ def analyze_positions(
   alerts = [r for r in results if r["flag"] != "正常"]
   if alerts:
     report_md.append(
-      "| コード | 名称 | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 | フラグ |"
+      "| コード | 名称 | 取得単価 | 保有日数 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 | フラグ / 推奨アクション |"
     )
-    report_md.append("|---|---|---|---|---|---|---|---|---|")
+    report_md.append("|---|---|---|---|---|---|---|---|---|---|")
     for r in alerts:
       if r["status"] == "success":
         ret_str = f"{r['unrealized_return'] * 100:+.2f}%"
@@ -203,21 +239,26 @@ def analyze_positions(
           else "校正データなし"
         )
         supp_note = f" ({r['support_note']})" if r["support_note"] else ""
+        action_note = (
+          f"<br>💡 <b>推奨:</b> {r['pos_status'].recommended_rule_action}"
+          if r["pos_status"]
+          else ""
+        )
         report_md.append(
-          f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str}{supp_note} | {r['flag']} |"
+          f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['holding_days']}日 | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str}{supp_note} | {r['flag']}{action_note} |"
         )
       else:
         report_md.append(
-          f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} (エラー: {r['error']}) |"
+          f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | - | - | - | - | - | - | {r['flag']} (エラー: {r['error']}) |"
         )
   else:
     report_md.append("現在、アラートが発生している銘柄はありません。")
 
   report_md.append("\n## 保有ポジション一覧")
   report_md.append(
-    "| コード | 名称 | 取得単価 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 (母数) | フラグ | 最新データ日 |"
+    "| コード | 名称 | 取得単価 | 買付日 | 保有日数 | 最新終値 | 損益率 | 予測 | 確信度 | 過去精度 (母数) | フラグ | 最新データ日 |"
   )
-  report_md.append("|---|---|---|---|---|---|---|---|---|---|")
+  report_md.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
   for r in results:
     if r["status"] == "success":
       ret_str = f"{r['unrealized_return'] * 100:+.2f}%"
@@ -229,11 +270,11 @@ def analyze_positions(
       )
       supp_note = f" {r['support_note']}" if r["support_note"] else ""
       report_md.append(
-        f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str} ({r['support']}){supp_note} | {r['flag']} | {r['date']} |"
+        f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['entry_date']} | {r['holding_days']}日 | {r['latest_close']:.1f} | {ret_str} | {r['predicted_label']} | {conf_str} | {prec_str} ({r['support']}){supp_note} | {r['flag']} | {r['date']} |"
       )
     else:
       report_md.append(
-        f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | - | - | - | - | - | {r['flag']} | - |"
+        f"| {r['code']} | {r['name']} | {r['entry_price']:.1f} | {r['entry_date']} | - | - | - | - | - | - | {r['flag']} | - |"
       )
 
   with open(actual_report_path, "w", encoding="utf-8") as f:
@@ -242,28 +283,75 @@ def analyze_positions(
   log.info("Report generated at %s", actual_report_path)
 
 
+def _resolve_default_path(filename: str, candidates: list[Path]) -> Path:
+  for c in candidates:
+    if c.exists():
+      return c
+  return candidates[0]
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description="Task 2: Batch Position Alert Checker")
+
+  # デフォルトパスの自動解決候補
+  default_positions = _resolve_default_path(
+    "positions.csv",
+    [
+      Path("train/positions.csv"),
+      Path("positions.csv"),
+      Path("../train/positions.csv"),
+    ],
+  )
+  default_models = _resolve_default_path(
+    "models/task2",
+    [
+      Path("train/models/task2"),
+      Path("models/task2"),
+      Path("../models/task2"),
+    ],
+  )
+  default_reliability = _resolve_default_path(
+    "reliability_table.json",
+    [
+      Path("train/reliability_table.json"),
+      Path("reliability_table.json"),
+      Path("../train/reliability_table.json"),
+    ],
+  )
+  default_config = _resolve_default_path(
+    "config.yaml",
+    [
+      Path("train/config/config.yaml"),
+      Path("config/config.yaml"),
+      Path("../train/config/config.yaml"),
+    ],
+  )
+  default_report = (
+    Path("reports/daily_check.md")
+    if Path("reports").exists()
+    else Path("train/reports/daily_check.md")
+  )
+
   parser.add_argument(
-    "--positions", type=Path, default=Path("positions.csv"), help="Positions CSV path"
+    "--positions", type=Path, default=default_positions, help="Positions CSV path"
   )
   parser.add_argument(
-    "--model-dir", type=Path, default=Path("models/task2"), help="Model directory"
+    "--model-dir", type=Path, default=default_models, help="Model directory"
   )
   parser.add_argument(
     "--reliability-table",
     type=Path,
-    default=Path("reliability_table.json"),
+    default=default_reliability,
     help="Reliability table JSON path",
   )
   parser.add_argument(
     "--report-out",
     type=Path,
-    default=Path("reports/daily_check.md"),
+    default=default_report,
     help="Report output Markdown path",
   )
   parser.add_argument(
-    "--config", type=Path, default=Path("config/config.yaml"), help="Config file path"
+    "--config", type=Path, default=default_config, help="Config file path"
   )
   parser.add_argument(
     "--data-dir", type=Path, default=None, help="Feature data directory (optional)"

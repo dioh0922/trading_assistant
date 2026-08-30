@@ -154,6 +154,21 @@ def main():
     help="日次一括フロー (scrape, daily, json, llm) を実行 (※モデル学習は除外)",
   )
   parser.add_argument(
+    "--check",
+    action="store_true",
+    help="【短縮】日次ポジションチェック・アラート判定のみ実行",
+  )
+  parser.add_argument(
+    "--json",
+    action="store_true",
+    help="【短縮】保有ポジションの銘柄詳細JSON生成を実行",
+  )
+  parser.add_argument(
+    "--daily",
+    action="store_true",
+    help="【短縮】データ更新と日次ポジションチェック (scrape, daily) を実行",
+  )
+  parser.add_argument(
     "--include-train",
     action="store_true",
     help="--all 実行時にモデル再学習 (train) も含める",
@@ -178,13 +193,21 @@ def main():
 
   args = parser.parse_args()
 
-  if not args.all and not args.steps:
+  if not (args.all or args.steps or args.check or args.json or args.daily):
     parser.print_help()
-    print("\n[エラー] --all または --steps のいずれかを指定してください。")
+    print(
+      "\n[エラー] --check, --json, --daily, --all または --steps のいずれかを指定してください。"
+    )
     sys.exit(1)
 
   steps_to_run = []
-  if args.all:
+  if args.check:
+    steps_to_run = ["daily"]
+  elif args.json:
+    steps_to_run = ["json"]
+  elif args.daily:
+    steps_to_run = ["scrape", "daily"]
+  elif args.all:
     if args.include_train:
       steps_to_run = ["scrape", "train", "daily", "json", "llm"]
     else:

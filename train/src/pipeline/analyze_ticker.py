@@ -11,6 +11,7 @@ import polars as pl
 from pipeline.config import load_config
 from pipeline.predict import load_ensemble_models, get_latest_features
 from pipeline.reliability import load_reliability_table, lookup_reliability
+from pipeline.rules import evaluate_position_rules
 
 logging.basicConfig(
   level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -55,6 +56,7 @@ def _analyze_single_ticker(
   data_dir: Path | None,
   out_json_path: Path,
   no_timestamp: bool = False,
+  entry_date: str | None = None,
 ) -> None:
   feature_cols = metadata["feature_columns"]
   classes = metadata["label_classes"]
@@ -85,8 +87,27 @@ def _analyze_single_ticker(
   )
 
   unrealized_return = None
+  position_status = None
   if entry_price is not None:
     unrealized_return = (latest_close - entry_price) / entry_price
+    pos_stat = evaluate_position_rules(
+      code=ticker,
+      entry_price=entry_price,
+      current_price=latest_close,
+      entry_date=entry_date,
+    )
+    position_status = {
+      "entry_price": pos_stat.entry_price,
+      "entry_date": pos_stat.entry_date,
+      "holding_days": pos_stat.holding_days,
+      "unrealized_return": pos_stat.unrealized_return,
+      "take_profit_hit": pos_stat.target_hit.take_profit_hit,
+      "stop_loss_hit": pos_stat.target_hit.stop_loss_hit,
+      "time_rule_triggered": pos_stat.time_rule_triggered,
+      "alert_level": pos_stat.alert_level,
+      "alert_message": pos_stat.alert_message,
+      "recommended_rule_action": pos_stat.recommended_rule_action,
+    }
 
   importances = load_feature_importance(model_dir, feature_cols, models)
 
@@ -109,6 +130,7 @@ def _analyze_single_ticker(
     "latest_close": latest_close,
     "entry_price": entry_price,
     "unrealized_return": unrealized_return,
+    "position_status": position_status,
     "prediction": {
       "predicted_label": predicted_label,
       "confidence": confidence,
@@ -144,6 +166,7 @@ def analyze_ticker(
   data_dir: Path | None,
   out_json_path: Path,
   no_timestamp: bool = False,
+  entry_date: str | None = None,
 ) -> None:
   log.info("Loading models from %s", model_dir)
   models, metadata = load_ensemble_models(model_dir)
@@ -163,31 +186,84 @@ def analyze_ticker(
     data_dir=data_dir,
     out_json_path=out_json_path,
     no_timestamp=no_timestamp,
+    entry_date=entry_date,
   )
+
+
+def _resolve_default_path(filename: str, candidates: list[Path]) -> Path:
+  for c in candidates:
+    if c.exists():
+      return c
+  return candidates[0]
 
 
 def main() -> None:
   parser = argparse.ArgumentParser(
     description="Task 3: Detailed Ticker Analyzer for LLM Context"
   )
+
+  default_positions = _resolve_default_path(
+    "positions.csv",
+    [
+      Path("train/positions.csv"),
+      Path("positions.csv"),
+      Path("../train/positions.csv"),
+    ],
+  )
+  default_models = _resolve_default_path(
+    "models/task2",
+    [
+      Path("train/models/task2"),
+      Path("models/task2"),
+      Path("../models/task2"),
+    ],
+  )
+  default_reliability = _resolve_default_path(
+    "reliability_table.json",
+    [
+      Path("train/reliability_table.json"),
+      Path("reliability_table.json"),
+      Path("../train/reliability_table.json"),
+    ],
+  )
+  default_config = _resolve_default_path(
+    "config.yaml",
+    [
+      Path("train/config/config.yaml"),
+      Path("config/config.yaml"),
+      Path("../train/config/config.yaml"),
+    ],
+  )
+  default_out_json = (
+    Path("reports/json/ticker_detail.json")
+    if Path("reports").exists()
+    else Path("train/reports/json/ticker_detail.json")
+  )
+
   parser.add_argument("--ticker", type=str, default=None, help="Stock ticker code")
   parser.add_argument(
     "--entry-price", type=float, default=None, help="Position entry price (optional)"
   )
   parser.add_argument(
+    "--entry-date",
+    type=str,
+    default=None,
+    help="Position entry date YYYY-MM-DD (optional)",
+  )
+  parser.add_argument(
     "--positions-csv", type=Path, default=None, help="Positions CSV path (batch mode)"
   )
   parser.add_argument(
-    "--model-dir", type=Path, default=Path("models/task2"), help="Model directory"
+    "--model-dir", type=Path, default=default_models, help="Model directory"
   )
   parser.add_argument(
     "--reliability-table",
     type=Path,
-    default=Path("reliability_table.json"),
+    default=default_reliability,
     help="Reliability table JSON path",
   )
   parser.add_argument(
-    "--config", type=Path, default=Path("config/config.yaml"), help="Config file path"
+    "--config", type=Path, default=default_config, help="Config file path"
   )
   parser.add_argument(
     "--data-dir", type=Path, default=None, help="Feature data directory (optional)"
@@ -195,7 +271,7 @@ def main() -> None:
   parser.add_argument(
     "--out-json",
     type=Path,
-    default=Path("reports/json/ticker_detail.json"),
+    default=default_out_json,
     help="Output detailed JSON path",
   )
   parser.add_argument(
@@ -206,8 +282,19 @@ def main() -> None:
 
   args = parser.parse_args()
 
-  if args.positions_csv:
-    log.info("Batch mode: loading positions from %s", args.positions_csv)
+  # tickerもpositions_csvも指定されていない場合、自動的にpositions.csvのバッチ処理にフォールバック
+  positions_csv_path = args.positions_csv
+  if args.ticker is None and positions_csv_path is None:
+    if default_positions.exists():
+      log.info(
+        "引数未指定のため、自動的に %s のバッチ処理を実行します。", default_positions
+      )
+      positions_csv_path = default_positions
+    else:
+      parser.error("Either --ticker or --positions-csv is required")
+
+  if positions_csv_path:
+    log.info("Batch mode: loading positions from %s", positions_csv_path)
     models, metadata = load_ensemble_models(args.model_dir)
     reliability_table = load_reliability_table(args.reliability_table)
     config = load_config(args.config)
@@ -216,10 +303,18 @@ def main() -> None:
     out_dir = args.out_json.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pl.read_csv(args.positions_csv)
+    df = pl.read_csv(positions_csv_path)
+    has_entry_date = "entry_date" in df.columns
     for row in df.iter_rows(named=True):
       ticker = str(row["code"])
-      entry_price = float(row["entry_price"])
+      entry_price = (
+        float(row["entry_price"]) if row.get("entry_price") is not None else None
+      )
+      entry_date = (
+        str(row["entry_date"])
+        if has_entry_date and row.get("entry_date") is not None
+        else None
+      )
       out_path = out_dir / f"{ticker}_detail.json"
       _analyze_single_ticker(
         ticker=ticker,
@@ -232,6 +327,7 @@ def main() -> None:
         data_dir=args.data_dir,
         out_json_path=out_path,
         no_timestamp=args.no_timestamp,
+        entry_date=entry_date,
       )
 
   else:
@@ -251,6 +347,7 @@ def main() -> None:
       data_dir=args.data_dir,
       out_json_path=out_path,
       no_timestamp=args.no_timestamp,
+      entry_date=args.entry_date,
     )
 
 
